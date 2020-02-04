@@ -1,0 +1,10 @@
+.vscode/
+H2/
+H2_many/
+HLi/
+HLi_many/
+__pycache__/
+cextension.so
+cextensions/obj/
+cextensions/main.out
+cextensions/build/
