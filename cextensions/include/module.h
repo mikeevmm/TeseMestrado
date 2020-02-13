@@ -24,6 +24,7 @@ typedef struct {
 } CoefTermIndexPair;
 
 static PyObject *find_used_partitions(PyObject *self, PyObject *args);
+static PyObject *decimate(PyObject *self, PyObject *args);
 
 static PyObject *ModuleError;
 
@@ -41,10 +42,14 @@ static PyMethodDef mod_methods[] = {
      "NOTE: hamiltonian is assumed to be sorted in descending "
      "number of interacting systems! If this is not the case, "
      "behaviour is undefined."},
+     {"decimate", decimate, METH_VARARGS,
+     "Reduce the locality of a hamiltonian to `floor(k/2)+1`, where "
+     "`k` is the locality of the given hamiltonian.\n"
+     "TODO"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef module = {
     PyModuleDef_HEAD_INIT, "cextension",
-    "Python C extension module template project.", -1, mod_methods};
+    "Implementation of routines in C for use in python project.", -1, mod_methods};
 
 #endif  // _MODULE_H_

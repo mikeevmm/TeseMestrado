@@ -4,6 +4,7 @@ import os
 import multiprocessing
 import subprocess
 import json
+import gc
 from copy import deepcopy
 
 __doc__ = """\
@@ -17,6 +18,9 @@ Options:
     --force -f      Do not ask about overriding files/
                     folders.
     --template      Create new template file.
+    --parallel      Run the processes in parallel.
+    --no-fail       Do not raise an exception if stderr
+                    from subprocess is non empty.
     [flags]         Flags to pass to lowerbound.py.
                     See lowerbound.py for details.
 """
@@ -115,7 +119,16 @@ if __name__ == '__main__':
     def on_simulation_complete(*args):
         pass
 
-    pool = multiprocessing.Pool(None)
-    r = pool.map_async(run_specfile, specfiles,
-                       callback=on_simulation_complete)
-    r.wait()
+    if '--parallel' not in arguments:
+        for specfile in specfiles:
+            stdout, stderr = run_specfile(specfile)
+            if not '--no-fail' in arguments and stderr:
+                print("FAILED")
+                raise Exception(stderr)
+            on_simulation_complete(specfile)
+            gc.collect()
+    else:
+        pool = multiprocessing.Pool(None)
+        r = pool.map_async(run_specfile, specfiles,
+                           callback=on_simulation_complete)
+        r.wait()

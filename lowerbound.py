@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 
-from openfermionpsi4 import run_psi4
-from openfermion.transforms import get_fermion_operator, get_sparse_operator, jordan_wigner
-from openfermion.hamiltonians import MolecularData
-from openfermion.ops import QubitOperator
-from openfermion.utils import get_ground_state
-from functools import reduce
-from collections import defaultdict
-from tqdm import tqdm
-from glob import glob
-from bisect import bisect_left
-from numpy import sqrt, abs, ceil
-import numpy as np
-import re
+import itertools
+import json
 import os
-import qop
 import random
+import re
+from bisect import bisect_left
+from collections import defaultdict
+from functools import reduce
+from glob import glob
+from itertools import chain
+
+import h5py
+import numpy as np
+import pathos.multiprocessing as mp
+import qop
 import scipy
 import scipy.optimize
-import json
-import itertools
-import h5py
+from more_itertools import partition
+from numpy import abs, ceil, sqrt
+from openfermion.hamiltonians import MolecularData
+from openfermion.ops import QubitOperator
+from openfermion.transforms import (get_fermion_operator, get_sparse_operator,
+                                    jordan_wigner)
+from openfermion.utils import get_ground_state
+from openfermionpsi4 import run_psi4
+from tqdm import tqdm
+
 import cextension
-import pathos.multiprocessing as mp
+
+STRETCH = 1
 
 __doc__ = """\
 Calculate a lower bound energy for a molecule.
@@ -66,6 +73,19 @@ Options:
                                 hamiltonian!
 """
 
+
+class NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return super(NpEncoder, self).default(obj)
+
+
 # Define parsing a line of a hamiltonian file
 
 
@@ -95,7 +115,7 @@ def parse_hamiltonian_line(line):
         systems.append(int(sys))
         operators.append(op.lower())
 
-    return float(coef), operators, systems
+    return [float(coef), operators, systems]
 
 # Produce a k-local hamiltonian via Schrieffer-Wolff transforms
 
@@ -104,6 +124,338 @@ epsilon = 0.1
 
 
 def schrieffer_wolff(hamiltonian_file, max_locality):
+    if max_locality == 2:
+        raise Exception("Max locality of 2 not implemented!")
+
+    available_ancilla = None
+
+    def decimate(terms):
+        nonlocal max_locality, available_ancilla
+        # `terms` is a collection of items with structure
+        # (<coef>, [<operator>], [<system index>])
+        # representing a hamiltonian that is the sum of all
+        # these items.
+        # These terms are **not reduced**
+
+        # We can ignore all terms that are below the intended locality
+        #terms = filter(lambda t: abs(t[0]) > 1e-4, terms)
+        not_involved, involved = partition(
+            lambda term: len(term[2]) > max_locality, terms)
+        not_involved = [list(x) for x in not_involved]
+        involved = list(involved)
+
+        # Find out what systems are involved in the terms to be reduced
+        systems_to_reduce = np.unique(
+            list(sum((term[2] for term in involved), [])))
+
+        try:
+            involved_coefs, involved_ops, involved_sys = zip(*involved)
+        except ValueError:
+            # If not enough values to unpack, that means involved was empty
+            return not_involved
+
+        involved_coefs = np.fromiter(involved_coefs, dtype=float)
+        involved_opssys = list((tuple(x), tuple(y))
+                               for x, y in zip(involved_ops, involved_sys))
+
+        # Determine coupling
+        coupling = np.max(np.abs(involved_coefs))
+
+        # Filter out very small contributions
+        mask = (np.abs(involved_coefs)*coupling/epsilon > 1e-4)
+        involved_coefs = involved_coefs[mask]
+        involved_opssys = np.array(involved_opssys)[mask].tolist()
+
+        # At this point, involved is a single JAB operator involving the systems in
+        # `systems_to_reduce` to be reduced by the k/2+1 gadget
+        # We need first to determine A and B; see `Splitting a Sum in Half` in the notes
+        system_cutoff = len(systems_to_reduce)//2
+        low_space = systems_to_reduce[:system_cutoff]
+        high_space = systems_to_reduce[system_cutoff:]
+        operators = ('x', 'y', 'z', 'i')
+
+        low_terms = []  # "A"
+        high_terms = []  # "B"
+
+        # Iterate (lexicographically?) over operators in the two spaces
+        # (Doesn't really matter if it's a lexicographical iteration I think)
+        for low_operators in itertools.product(operators, repeat=len(low_space)):
+            # The first coefficient found in O so that other terms of B
+            # relate to it
+            # Choose as reference coefficient the smallest coefficient with this
+            # base
+            min_coef = None
+            max_coef = None
+            for high_operators in itertools.product(operators, repeat=len(high_space)):
+                # We can skip the full identity, as we know this will
+                # never be in the list of terms to reduce!
+                full_operators = low_operators + high_operators
+                if len(full_operators) * ('i',) == full_operators:
+                    continue
+
+                # Build the (<operators>, <systems>) pair to look for in `involved`
+                ops_sys = tuple(zip(*filter(lambda x: x[0] != 'i', zip(
+                    full_operators, systems_to_reduce))))
+
+                try:
+                    term_index = involved_opssys.index(ops_sys)
+                except ValueError:
+                    continue
+
+                # Is candidate for reference?
+                coef = involved_coefs[term_index]
+                if min_coef is None or abs(coef) < abs(min_coef):
+                    min_coef = coef
+                if max_coef is None or abs(coef) > abs(max_coef):
+                    max_coef = coef
+
+            if min_coef is None:
+                continue  # There is no term with this base
+
+            reference_coef = (abs(max_coef) + abs(min_coef))/2
+
+            # Add the reference term to A
+            low_ops_sys = zip(
+                *filter(lambda x: x[0] != 'i',
+                        zip(low_operators, systems_to_reduce[:system_cutoff])))
+            new_elem = [reference_coef, *(list(x)
+                                            for x in low_ops_sys)]
+            if len(new_elem) == 1:
+                new_elem = [reference_coef, [], []]
+            low_terms.append(new_elem)
+
+            # Proceed for other terms (in B)
+            for high_operators in itertools.product(operators, repeat=len(high_space)):
+                # We can skip the full identity, as we know this will
+                # never be in the list of terms to reduce!
+                full_operators = low_operators + high_operators
+                if len(full_operators) * ('i',) == full_operators:
+                    continue
+
+                # Build the (<operators>, <systems>) pair to look for in `involved`
+                ops_sys = tuple(zip(*filter(lambda x: x[0] != 'i', zip(
+                    full_operators, systems_to_reduce))))
+
+                try:
+                    term_index = involved_opssys.index(ops_sys)
+                except ValueError:
+                    continue
+
+                # Reference coef is already known;
+                # add this term to B
+                high_ops_sys = tuple(zip(*filter(lambda x: x[0] != 'i', zip(
+                    high_operators, systems_to_reduce[system_cutoff:]))))
+                coef = involved_coefs[term_index] / reference_coef
+                new_elem = [coef, *(list(x) for x in high_ops_sys)]
+                if len(new_elem) == 1:
+                    new_elem = [coef, [], []]
+                high_terms.append(new_elem)
+
+        # A and B are created.
+        # NOTE that these are already the "reduced" operators, i.e. `O = JAB`
+        # Now we need to determine A² and B²
+
+        # TODO: Go over this code very carefully. I'm not entirely sure
+        # it's correct.
+        def determine_square(terms):
+            squared = [[sum(coef**2 for coef, _, _ in terms), [], []]]
+
+            # Find the cross terms contributions
+            # (`itertools.combinations` is in lexical order)
+            # `left` and `right` correspond to the `i` and `j` terms in the sum
+            # for left, right in itertools.combinations(terms, r=2):
+            for i, left in enumerate(terms):
+                for right in terms[:i]:
+                    # If the terms differ in an even number of
+                    # operators, 2k, there is a term ~(-1)^k
+                    # We need to build the "common" set of operators/systems
+                    systems = []
+                    left_ops = []
+                    right_ops = []
+
+                    left_ptr = 0
+                    right_ptr = 0
+                    while left_ptr < len(left[1]) or right_ptr < len(right[1]):
+                        if left_ptr < len(left[2]):
+                            # Within bounds to left
+                            if right_ptr < len(right[2]):
+                                # Within bounds to right
+                                if left[2][left_ptr] < right[2][right_ptr]:
+                                    systems.append(left[2][left_ptr])
+                                    left_ops.append(left[1][left_ptr])
+                                    right_ops.append('i')
+                                    left_ptr += 1
+                                elif right[2][right_ptr] < left[2][left_ptr]:
+                                    systems.append(right[2][right_ptr])
+                                    left_ops.append('i')
+                                    right_ops.append(right[1][right_ptr])
+                                    right_ptr += 1
+                                else:
+                                    systems.append(left[2][left_ptr])
+                                    left_ops.append(left[1][left_ptr])
+                                    right_ops.append(right[1][right_ptr])
+                                    left_ptr += 1
+                                    right_ptr += 1
+                            else:
+                                # Outside bounds to right;
+                                # add the rest of left
+                                systems.extend(left[2][left_ptr:])
+                                right_ops.extend(
+                                    ('i',)*(len(left[2]) - left_ptr))
+                                left_ops.extend(left[1][left_ptr:])
+                                break
+                        else:
+                            # Outside bounds to left;
+                            # add the rest of right
+                            systems.extend(right[2][right_ptr:])
+                            left_ops.extend(('i',)*(len(right[2]) - right_ptr))
+                            right_ops.extend(right[1][right_ptr:])
+                            break
+
+                    if len(left_ops) == 0:  # This is a scalar term
+                        assert(len(right_ops) == 0)
+                        squared.append([2*left[0]*right[0], [], []])
+                        continue
+
+                    # If the two terms differ in an uneven number of operators,
+                    # they will not contribute to the cross-term of the square
+                    # Note that identities do not "count" in terms of flipping
+                    # the sign, so there must be an even number of differences
+                    # *not* with the identity for the term not to disappear
+                    ops_arr = np.array([left_ops, right_ops])
+                    systems = np.array(systems)
+                    not_in_common = ((ops_arr[0, :] != 'i') &
+                                     (ops_arr[1, :] != 'i') &
+                                     (ops_arr[0, :] != ops_arr[1, :])).sum()
+                    if not_in_common % 2 != 0:
+                        continue
+
+                    # Build the contribution
+                    # TODO: I am doing this naive-ly, because I couldn't find
+                    # any clever way to do it.
+                    different = (ops_arr[0, :] != ops_arr[1, :])
+                    contrib_sign = 1 if ((not_in_common//2) %
+                                         2 == 0) else -1  # from i^(2k)
+                    contrib_coef = contrib_sign*2*left[0]*right[0]
+                    contrib_ops = []
+                    contrib_sys = []
+                    for op_a, op_b, sys in zip(ops_arr[0, different],
+                                               ops_arr[1, different],
+                                               systems[different]):
+                        contrib_sys.append(sys)
+                        if op_a == 'i':
+                            contrib_ops.append(op_b)
+                        elif op_b == 'i':
+                            contrib_ops.append(op_a)
+                        elif op_a == 'x':
+                            if op_b == 'y':
+                                contrib_ops.append('z')
+                            else:
+                                assert(op_b == 'z')
+                                contrib_sign *= -1
+                                contrib_ops.append('y')
+                        elif op_a == 'y':
+                            if op_b == 'z':
+                                contrib_ops.append('x')
+                            else:
+                                assert(op_b == 'x')
+                                contrib_sign *= -1
+                                contrib_ops.append('z')
+                        elif op_a == 'z':
+                            if op_b == 'x':
+                                contrib_ops.append('y')
+                            else:
+                                assert(op_b == 'y')
+                                contrib_sign *= -1
+                                contrib_ops.append('x')
+                    squared.append([contrib_coef, contrib_ops, contrib_sys])
+
+            # Remove redundant terms!
+            squared.sort(key=lambda term: term[1:])
+            squared = list(
+                map(
+                    lambda kg: [sum(x[0] for x in kg[1]), *kg[0]],
+                    itertools.groupby(
+                        squared,
+                        key=lambda coef_ops_sys: coef_ops_sys[1:])))
+
+            return squared
+
+        low_terms_sqrd = determine_square(low_terms)
+        high_terms_sqrd = determine_square(high_terms)
+
+        # The squared terms have been determined, we may now create the
+        # Schrieffer-Wolff hamiltonian.
+
+        used_ancilla = available_ancilla
+        available_ancilla += 1
+        sw_low = \
+            [[coupling**3/epsilon**2/2, ['|1><1|'], [used_ancilla]]] + \
+            [[-0.707106781*coupling**2*term[0]/epsilon, [*term[1], 'x'],
+              [*term[2], used_ancilla]]
+             for term in low_terms] + \
+            [[0.5*term[0]*coupling, term[1], term[2]]
+             for term in low_terms_sqrd]
+        sw_high = \
+            [[coupling**3/epsilon**2/2, ['|1><1|'], [used_ancilla]]] + \
+            [[0.707106781*term[0]/epsilon*coupling, [*term[1], 'x'],
+              [*term[2], used_ancilla]]
+                for term in high_terms] + \
+            [[0.5*term[0]/coupling, term[1], term[2]]
+             for term in high_terms_sqrd]
+
+        # We can't just re-decimate the resulting sw_hamiltonian;
+        # To see why, take for example
+        #   H = H_{12345} = H_{123} + H_{45}
+        # It is favourable to consider the sum as a single term,
+        # because then only a single ancilla is introduced.
+        # However, the resulting reduced-locality hamiltonian
+        #   J.H_{123}.H_{45} -> ~H_{123u} + H_{45u}
+        # is so that if we try again take the sum as a whole, we
+        # actually go up in the body count (H_{12345u}).
+        sw_low = decimate(sw_low)
+        sw_high = decimate(sw_high)
+
+        # Finally, re-clean
+        sw_hamiltonian = [
+            *sw_low,
+            *sw_high,
+            *not_involved
+        ]
+
+        sw_hamiltonian.sort(key=lambda term: term[1:])
+        sw_hamiltonian = list(
+            map(
+                lambda kg: [sum(x[0] for x in kg[1]), *kg[0]],
+                itertools.groupby(
+                    sw_hamiltonian,
+                    key=lambda coef_ops_sys: coef_ops_sys[1:])))
+
+        return sw_hamiltonian
+
+    # Read the hamiltonian file;
+    # Get from the file:
+    #  - Number of interacting systems (to determine ancilla index)
+    #  - Hamiltonian in [(coef, operators, systems)] form
+    # We immediately decimate each of the terms and return all the
+    # terms
+    hamiltonian_terms = []
+
+    with open(hamiltonian_file) as hamiltonian_fileio:
+        for line in hamiltonian_fileio:
+            if line.startswith('#!Ancilla Qubits Start At'):
+                available_ancilla = int(
+                    line[len('#!Ancilla Qubits Start At'):])
+            if line.startswith('#'):
+                continue
+            term = parse_hamiltonian_line(line)
+            hamiltonian_terms.append(term)
+
+    # Returns: Hamiltonian terms, number of systems involved
+    return decimate(hamiltonian_terms), available_ancilla
+
+
+def schrieffer_wolff_legacy(hamiltonian_file, max_locality):
     # The next available ancilla qubit index
     # This variable needs to be set once hamiltonian_file is read
     available_ancilla = None
@@ -230,15 +582,20 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
 
 
 def matrix_from_terms(hamiltonian, num_systems):
-    total_hamiltonian = np.zeros(
+    total_hamiltonian = scipy.sparse.coo_matrix(
         (2**num_systems, 2**num_systems), dtype=complex)
     for term in hamiltonian:
         coef, operators, systems = term
 
+        if len(systems) == 0:
+            total_hamiltonian += coef * \
+                scipy.sparse.eye(2**num_systems, dtype=complex)
+            continue
+
         # Create a representation of the decomposed hamiltonian
-        operator_matrix = 1
+        operator_matrix = scipy.sparse.eye(2**min(systems), dtype=complex)
         actual_op_index = 0
-        for i in range(num_systems):
+        for i in range(min(systems), max(systems)+1):
             if actual_op_index < len(systems) and systems[actual_op_index] == i:
                 operator = operators[actual_op_index]
                 if operator == 'x':
@@ -253,19 +610,22 @@ def matrix_from_terms(hamiltonian, num_systems):
                     operator = np.matrix(((0, 0), (0, 1)), dtype=complex)
                 else:
                     raise Exception(f"Unknown operator {operator}")
-                operator_matrix = np.kron(
-                    operator_matrix, operator)
+                operator_matrix = scipy.sparse.kron(
+                    operator_matrix, scipy.sparse.coo_matrix(operator))
                 actual_op_index += 1
             else:
-                operator_matrix = np.kron(
-                    operator_matrix, np.eye(2, dtype=complex))
+                operator_matrix = scipy.sparse.kron(
+                    operator_matrix, scipy.sparse.eye(2, dtype=complex))
+        operator_matrix = scipy.sparse.kron(operator_matrix,
+                                            scipy.sparse.eye(2**(num_systems - max(systems) - 1)))
         assert(operator_matrix.shape == (2**num_systems, 2**num_systems))
         total_hamiltonian += coef * operator_matrix
     return total_hamiltonian
 
 
 def ground_state_from_terms(hamiltonian, num_systems):
-    return np.min(np.linalg.eigvals(matrix_from_terms(hamiltonian, num_systems))).real
+    return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
+        k=1, which='SA', return_eigenvectors=False))
 
 
 if __name__ == '__main__':
@@ -362,8 +722,10 @@ if __name__ == '__main__':
     n_points = molecule_json['molecule']['bond']['npoints']
     start_bond_length = molecule_json['molecule']['bond']['start']
     end_bond_length = molecule_json['molecule']['bond']['end']
-    active_space_start = molecule_json['simulation']['active_space']['start']
-    active_space_stop = molecule_json['simulation']['active_space']['stop']
+    active_space_start = molecule_json['simulation']['active_space'].get(
+        'start', None)
+    active_space_stop = molecule_json['simulation']['active_space'].get(
+        'stop', None)
     epsilon = molecule_json['simulation']['epsilon']
 
     # Set calculation parameters.
@@ -444,14 +806,17 @@ if __name__ == '__main__':
                 # A list of spatial orbital indices indicating which
                 # orbitals should be considered active.
                 molecular_hamiltonian = molecule.get_molecular_hamiltonian(
-                    occupied_indices=range(active_space_start),
-                    active_indices=range(active_space_start, active_space_stop))
+                    occupied_indices=range(
+                        active_space_start) if active_space_start is not None else None,
+                    active_indices=range(active_space_start, active_space_stop) if active_space_stop is not None else None)
 
                 # Map operator to fermions and qubits.
                 fermion_hamiltonian = get_fermion_operator(
                     molecular_hamiltonian)
                 qubit_hamiltonian = jordan_wigner(fermion_hamiltonian)
                 qubit_hamiltonian.compress()
+
+                qubit_hamiltonian *= STRETCH
 
                 # Find out what the largest coupling is,
                 # And the number of qubits involved
@@ -476,17 +841,17 @@ if __name__ == '__main__':
                     outfile.write(f"#!Largest Coupling {largest_coupling}\n")
                     outfile.write(f"#!Ancilla Qubits Start At {max_q_index}\n")
                     if run_scf:
-                        outfile.write(f"#!HF-energy {molecule.hf_energy}\n")
+                        outfile.write(f"#!HF-energy {molecule.hf_energy * STRETCH}\n")
                     if run_ccsd:
                         outfile.write(
-                            f"#!CCSD-energy {molecule.ccsd_energy}\n")
+                            f"#!CCSD-energy {molecule.ccsd_energy * STRETCH}\n")
                     if run_cisd:
                         outfile.write(
-                            f"#!CISD-energy {molecule.cisd_energy}\n")
+                            f"#!CISD-energy {molecule.cisd_energy * STRETCH}\n")
                     if run_mp2:
-                        outfile.write(f"#!MP2-energy {molecule.mp2_energy}\n")
+                        outfile.write(f"#!MP2-energy {molecule.mp2_energy * STRETCH}\n")
                     if run_fci:
-                        outfile.write(f"#!FCI-energy {molecule.fci_energy}\n")
+                        outfile.write(f"#!FCI-energy {molecule.fci_energy * STRETCH}\n")
                     outfile.write("# Jordan-Wigner hamiltonian follows\n")
                     outfile.write(f"{qubit_hamiltonian}")
                 print(f"Finished writing {molecule.filename + '.hamiltonian'}")
@@ -540,8 +905,8 @@ if __name__ == '__main__':
                 outfile.write(
                     '# Schrieffer-Wolff decomposition as JSON follows:\n')
                 json.dump([
-                    (sum(x[0] for x in g), k[0], k[1]) for k, g in itertools.groupby(sw, key=lambda x: (x[1], x[2]))
-                ], outfile)
+                    (sum(x[0] for x in g), *k) for k, g in itertools.groupby(sw, key=lambda x: x[1:])
+                ], outfile, cls=NpEncoder)
 
     # Performing aggregation of terms:
     # There is only one possible partitioning of a `n`-qubit system at a max locality
@@ -698,19 +1063,22 @@ if __name__ == '__main__':
 
                 def mp_lowerbound(args):
                     partition, terms = args
-                    return ground_state_from_terms(list(
+                    return ground_state_from_terms(
                         map(lambda x: (x[0], x[1], [partition.index(y) for y in x[2]]),
-                            map(lambda x: (x[0], *hamiltonian[x[1]][1:]), terms))), len(partition))
+                            map(lambda x: (x[0], *hamiltonian[x[1]][1:]), terms)), len(partition))
 
                 lower_bound = sum(
                     pool.map(mp_lowerbound, zip(partitions, split)))
 
-                """for partition, terms in zip(partitions, split):
+                """
+                for partition, terms in zip(partitions, split):
                     terms = [(x[0], *hamiltonian[x[1]][1:]) for x in terms]
-                    terms = [(x[0], x[1], [partition.index(y) for y in x[2]]) for x in terms]
+                    terms = [(x[0], x[1], [partition.index(y)
+                              for y in x[2]]) for x in terms]
                     local_ground_state = ground_state_from_terms(
                         terms, len(partition))
-                    lower_bound += local_ground_state"""
+                    lower_bound += local_ground_state
+                """
 
                 intermediate["lower_bounds"][i] = lower_bound
 

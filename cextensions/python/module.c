@@ -460,3 +460,7 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
 
   return return_tuple;
 }
+
+static PyObject *decimate(PyObject *self, PyObject *args) {
+  
+}
