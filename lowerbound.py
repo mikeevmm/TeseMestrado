@@ -278,22 +278,18 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
             # If not enough values to unpack, that means involved was empty
             return not_involved
 
+        sw_hamiltonian = not_involved
         involved_coefs = np.fromiter(involved_coefs, dtype=float)
         involved_opssys = [(tuple(x), tuple(y))
                            for x, y in zip(involved_ops, involved_sys)]
 
-        # Determine coupling
-        coupling = np.max(np.abs(involved_coefs))
-
         # Filter out very small contributions
-        mask = (np.abs(involved_coefs)/coupling > 1e-6)
+        mask = (np.abs(involved_coefs)/np.max(involved_coefs) > 1e-6)
         involved_coefs = involved_coefs[mask]
-        involved_opssys = [involved_opssys[i]
-                           for i in range(len(involved_opssys)) if mask[i]]
+        involved_opssys = [involved_opssys[sv_index]
+                           for sv_index in range(len(involved_opssys)) if mask[sv_index]]
 
-        # At this point, involved is a single JAB operator involving the systems in
-        # `systems_to_reduce` to be reduced by the k/2+1 gadget
-        # We need first to determine A and B; see `Splitting a Sum in Half` in the notes
+        # Perform the actual reduction
         system_cutoff = len(systems_to_reduce)//2
         low_space = systems_to_reduce[:system_cutoff]
         high_space = systems_to_reduce[system_cutoff:]
@@ -324,95 +320,113 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
                 col.append(high_index)
                 values.append(involved_coefs[term_index])
 
-        sw_hamiltonian = [*not_involved]
-
         if sum(value**2 for value in values) < 1e-5:
             return sw_hamiltonian
 
         # We will need an ancilla for each singular value
         c = scipy.sparse.coo_matrix((values, (row, col)), shape=(
             len(operators)**len(low_space), len(operators)**len(high_space))).tocsr()
+        u, s, vt = scipy.sparse.linalg.svds(c, return_singular_vectors=True, ncv=25)
 
-        coefs = np.random.random_sample((len(operators)**len(low_space) + len(operators)**len(high_space),))
-        def to_min(coefs):
-            ais = scipy.sparse.csr_matrix(coefs[:len(operators)**len(low_space)])
-            bis = scipy.sparse.csr_matrix(coefs[len(operators)**len(low_space):]).transpose()
-            return scipy.sparse.linalg.norm(scipy.sparse.kron(ais, bis) - c)
+        # The operator can be written as Sum(Tensor(u[i], s[i]*vt[i].T) for i)
+        for sv_index in range(s.shape[0]):
+            if s[sv_index] == 0:
+                continue
 
-        opt_result = scipy.optimize.minimize(to_min, coefs)
-        ais = (opt_result.x)[:len(operators)**len(low_space)]
-        bis = (opt_result.x)[len(operators)**len(low_space):]
+            # ui and vi contain the coefficients for the low and high spaces
+            uk = u[:, sv_index]
+            vk = vt[sv_index, :] * s[sv_index]
 
-        low_terms = []  # "A"
-        high_terms = []  # "B"
+            # Convert uk, vk into the operator form
+            # See that if our "components" are ('x', 'y', 'z', 'i')
+            # And we're producing e.g. 3-sized combinatitions in order
+            # 0 --> xxx
+            # 1 --> xxy
+            # 2 --> xxz
+            # 3 --> xxi
+            # 4 --> xyx
+            # etc.
+            # Then the it works essentially as a `components`-sized decimal system
+            # and the "digit" at position `j` (right-to-left) of number `i` is
+            # given by `components[(i // len(components)**j) % len(components)]`
+            coupling = np.max((np.max(np.abs(uk)), np.max(np.abs(vk))))
+            low_component = [
+                [uki, [operators[(low_index // len(operators)**(pos - 1)) % len(operators)]
+                       for pos in range(len(low_space), 0, -1)], list(low_space)]
+                for low_index, uki in enumerate(uk)
+                if uki != 0
+            ]
+            high_component = [
+                [vki, [operators[(high_index // len(operators)**(pos - 1)) % len(operators)]
+                       for pos in range(len(high_space), 0, -1)], list(high_space)]
+                for high_index, vki in enumerate(vk)
+                if vki != 0
+            ]
 
-        for low_index, low_operators in enumerate(itertools.product(operators, repeat=len(low_space))):
-            #if abs(ais[low_index]) < 1e-5:
-            #    continue
-            ops_sys = tuple(
-                zip(*filter(lambda x: x[0] != 'i', zip(low_operators, low_space))))
-            if len(ops_sys) == 0:
-                ops_sys = ([], [])
-            low_terms.append([ais[low_index] / sqrt(coupling),
-                            list(ops_sys[0]), list(ops_sys[1])])
+            # Filter both `low_component` and `high_component` from identities
+            low_component = [
+                (
+                    [elem[0], *(list(x)
+                                for x in zip(*filter(
+                                    lambda x: x[0] != 'i',
+                                    zip(elem[1], elem[2])
+                                ))
+                                )]
+                    if elem[1] != ['i']*len(elem[1]) else
+                    [elem[0], [], []]
+                )
+                for elem in low_component
+            ]
+            high_component = [
+                (
+                    [elem[0], *(list(x)
+                                for x in zip(*filter(
+                                    lambda x: x[0] != 'i',
+                                    zip(elem[1], elem[2])
+                                ))
+                                )]
+                    if elem[1] != ['i']*len(elem[1]) else
+                    [elem[0], [], []]
+                )
+                for elem in high_component
+            ]
 
-        for high_index, high_operators in enumerate(itertools.product(operators, repeat=len(high_space))):
-            #if abs(bis[high_index]) < 1e-5:
-            #    continue
-            ops_sys = tuple(zip(*filter(lambda x: x[0] != 'i', zip(
-                high_operators, high_space))))
-            if len(ops_sys) == 0:
-                ops_sys = ([], [])
-            high_terms.append(
-                [bis[high_index] / sqrt(coupling), list(ops_sys[0]), list(ops_sys[1])])
+            # The ancilla for this term
+            used_ancilla = available_ancilla
+            available_ancilla += 1
 
-        # A and B are created.
-        # NOTE that these are already the "reduced" operators, i.e. `O = JAB`
-        # Now we need to determine A² and B²
+            local_terms = [
+                [coupling / epsilon**2, ['|1><1|'], [used_ancilla]],
+                *(
+                    [-sqrt(coupling/2)/epsilon*uki,
+                     [*ops, 'x'], [*space, used_ancilla]]
+                    for uki, ops, space in low_component
+                ),
+                *(
+                    [sqrt(coupling/2)/epsilon*vki,
+                     [*ops, 'x'], [*space, used_ancilla]]
+                    for vki, ops, space in high_component
+                ),
+                *(
+                    [coef/2, ops, space]
+                    for coef, ops, space in determine_square(low_component)
+                ),
+                *(
+                    [coef/2, ops, space]
+                    for coef, ops, space in determine_square(high_component)
+                )
+            ]
 
-        low_terms_sqrd = determine_square(low_terms)
-        high_terms_sqrd = determine_square(high_terms)
-
-        # The squared terms have been determined, we may now create the
-        # Schrieffer-Wolff hamiltonian.
-
-        used_ancilla = available_ancilla
-        available_ancilla += 1
-
-        # [[coupling/epsilon**2/2, ['|1><1|'], [used_ancilla]]] + \
-        sw_low = \
-            [[-0.707106781*coupling**2*term[0]/epsilon, [*term[1], 'x'],
-                [*term[2], used_ancilla]]
-                for term in low_terms] + \
-            [[0.5*term[0]*coupling, term[1], term[2]]
-                for term in low_terms_sqrd]
-
-        # [[coupling/epsilon**2/2, ['|1><1|'], [used_ancilla]]] + \
-        sw_high = \
-            [[0.707106781*coupling**2*term[0]/epsilon, [*term[1], 'x'],
-                [*term[2], used_ancilla]]
-                for term in high_terms] + \
-            [[0.5*term[0]*coupling, term[1], term[2]]
-                for term in high_terms_sqrd]
-
-        # We can't just re-decimate the resulting sw_hamiltonian;
-        # To see why, take for example
-        #   H = H_{12345} = H_{123} + H_{45}
-        # It is favourable to consider the sum as a single term,
-        # because then only a single ancilla is introduced.
-        # However, the resulting reduced-locality hamiltonian
-        #   J.H_{123}.H_{45} -> ~H_{123u} + H_{45u}
-        # is so that if we try again take the sum as a whole, we
-        # actually go up in the body count (H_{12345u}).
-        sw_low = decimate(sw_low)
-        sw_high = decimate(sw_high)
-
-        # Finally, re-clean
-        sw_hamiltonian.extend([
-            [coupling**3/epsilon**2, ['|1><1|'], [used_ancilla]],
-            *sw_low,
-            *sw_high,
-        ])
+            local_terms = [elem for elem in local_terms if abs(elem[0]) > 1e-4]
+            local_terms.sort(key=lambda term: term[1:])
+            local_terms = list(
+                map(
+                    lambda kg: [sum(x[0] for x in kg[1]), *kg[0]],
+                    itertools.groupby(
+                        local_terms,
+                        key=lambda coef_ops_sys: coef_ops_sys[1:])))
+            local_terms = decimate(local_terms)
+            sw_hamiltonian.extend(local_terms)
 
         sw_hamiltonian.sort(key=lambda term: term[1:])
         sw_hamiltonian = list(
@@ -615,8 +629,9 @@ def matrix_from_terms(hamiltonian, num_systems):
 
 
 def ground_state_from_terms(hamiltonian, num_systems):
-    return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
-                                            k=1, which='SA', return_eigenvectors=False))
+    #return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
+    #                                        k=1, which='SA', return_eigenvectors=False))
+    return np.min(np.linalg.eigvalsh(matrix_from_terms(hamiltonian, num_systems).todense()))
 
 
 if __name__ == '__main__':
@@ -1066,7 +1081,7 @@ if __name__ == '__main__':
                             map(lambda x: (x[0], *hamiltonian[x[1]][1:]), terms)), len(partition))
 
                 lower_bound = sum(map(mp_lowerbound, zip(partitions, split)))
-                #lower_bound = sum(
+                # lower_bound = sum(
                 #    pool.map(mp_lowerbound, zip(partitions, split)))
 
                 def mp_lowerbound_nopart(term):
@@ -1074,14 +1089,14 @@ if __name__ == '__main__':
                         return term[0]
                     keyed_term = [term[0], term[1], [
                         i for i in range(len(term[2]))]]
-                    matrix = matrix_from_terms([keyed_term], len(term[2])).todense()
+                    matrix = matrix_from_terms(
+                        [keyed_term], len(term[2])).todense()
                     return np.min(np.linalg.eigvalsh(matrix))
-                
-                lower_bound_nopart = sum(map(mp_lowerbound_nopart, hamiltonian))
-                #lower_bound_nopart = sum(
-                #    pool.map(mp_lowerbound_nopart, hamiltonian))                
 
-                
+                lower_bound_nopart = sum(
+                    map(mp_lowerbound_nopart, hamiltonian))
+                # lower_bound_nopart = sum(
+                #    pool.map(mp_lowerbound_nopart, hamiltonian))
 
                 """
                 for partition, terms in zip(partitions, split):
