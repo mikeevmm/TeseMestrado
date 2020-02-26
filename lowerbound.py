@@ -262,6 +262,8 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
         # these items.
         # These terms are **not reduced**
 
+        terms = filter(lambda term: abs(term[0]) > 1e-6, terms)
+
         # We can ignore all terms that are below the intended locality
         not_involved, involved = partition(
             lambda term: len(term[2]) > max_locality, terms)
@@ -284,10 +286,13 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
                            for x, y in zip(involved_ops, involved_sys)]
 
         # Filter out very small contributions
-        mask = (np.abs(involved_coefs)/np.max(involved_coefs) > 1e-6)
+        mask = (np.abs(involved_coefs) > 1e-6)
         involved_coefs = involved_coefs[mask]
         involved_opssys = [involved_opssys[sv_index]
                            for sv_index in range(len(involved_opssys)) if mask[sv_index]]
+
+        if len(involved_coefs) == 0:
+            return not_involved
 
         # Perform the actual reduction
         system_cutoff = len(systems_to_reduce)//2
@@ -320,17 +325,14 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
                 col.append(high_index)
                 values.append(involved_coefs[term_index])
 
-        if sum(value**2 for value in values) < 1e-5:
-            return sw_hamiltonian
-
         # We will need an ancilla for each singular value
         c = scipy.sparse.coo_matrix((values, (row, col)), shape=(
             len(operators)**len(low_space), len(operators)**len(high_space))).tocsr()
-        u, s, vt = scipy.sparse.linalg.svds(c, return_singular_vectors=True, ncv=25)
+        u, s, vt = scipy.sparse.linalg.svds(c, return_singular_vectors=True, ncv=25, which='LM')
 
         # The operator can be written as Sum(Tensor(u[i], s[i]*vt[i].T) for i)
         for sv_index in range(s.shape[0]):
-            if s[sv_index] == 0:
+            if abs(s[sv_index]) < 1e-6:
                 continue
 
             # ui and vi contain the coefficients for the low and high spaces
@@ -395,29 +397,35 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
             used_ancilla = available_ancilla
             available_ancilla += 1
 
-            local_terms = [
-                [coupling / epsilon**2, ['|1><1|'], [used_ancilla]],
+            low_reduced = decimate([
                 *(
                     [-sqrt(coupling/2)/epsilon*uki,
                      [*ops, 'x'], [*space, used_ancilla]]
                     for uki, ops, space in low_component
                 ),
                 *(
+                    [coef/2, ops, space]
+                    for coef, ops, space in determine_square(low_component)
+                )
+            ])
+            high_reduced = decimate([
+                *(
                     [sqrt(coupling/2)/epsilon*vki,
                      [*ops, 'x'], [*space, used_ancilla]]
                     for vki, ops, space in high_component
                 ),
-                *(
-                    [coef/2, ops, space]
-                    for coef, ops, space in determine_square(low_component)
-                ),
+                
                 *(
                     [coef/2, ops, space]
                     for coef, ops, space in determine_square(high_component)
                 )
-            ]
+            ])
 
-            local_terms = [elem for elem in local_terms if abs(elem[0]) > 1e-4]
+            local_terms = [
+                [coupling / epsilon**2, ['|1><1|'], [used_ancilla]],
+                *low_reduced,
+                *high_reduced,
+            ]
             local_terms.sort(key=lambda term: term[1:])
             local_terms = list(
                 map(
@@ -425,8 +433,7 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
                     itertools.groupby(
                         local_terms,
                         key=lambda coef_ops_sys: coef_ops_sys[1:])))
-            local_terms = decimate(local_terms)
-            sw_hamiltonian.extend(local_terms)
+            sw_hamiltonian.extend(decimate(local_terms))
 
         sw_hamiltonian.sort(key=lambda term: term[1:])
         sw_hamiltonian = list(
@@ -631,7 +638,7 @@ def matrix_from_terms(hamiltonian, num_systems):
 def ground_state_from_terms(hamiltonian, num_systems):
     #return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
     #                                        k=1, which='SA', return_eigenvectors=False))
-    return np.min(np.linalg.eigvalsh(matrix_from_terms(hamiltonian, num_systems).todense()))
+    return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems), which='SA', return_eigenvectors=False))
 
 
 if __name__ == '__main__':
