@@ -121,6 +121,7 @@ def parse_hamiltonian_line(line):
 
 
 epsilon = 0.1
+CUTOFF = 1e-6
 
 
 def schrieffer_wolff(hamiltonian_file, max_locality):
@@ -254,7 +255,7 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
                     key=lambda coef_ops_sys: coef_ops_sys[1:])))
         return squared
 
-    def decimate(terms):
+    def decimate(terms, locality):
         nonlocal max_locality, available_ancilla
         # `terms` is a collection of items with structure
         # (<coef>, [<operator>], [<system index>])
@@ -262,7 +263,7 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
         # these items.
         # These terms are **not reduced**
 
-        terms = filter(lambda term: abs(term[0]) > 1e-6, terms)
+        terms = filter(lambda term: abs(term[0]) > CUTOFF, terms)
 
         # We can ignore all terms that are below the intended locality
         not_involved, involved = partition(
@@ -270,170 +271,152 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
         not_involved = [list(x) for x in not_involved]
         involved = list(involved)
 
-        # Find out what systems are involved in the terms to be reduced
-        systems_to_reduce = np.unique(
-            list(sum((term[2] for term in involved), [])))
-
-        try:
-            involved_coefs, involved_ops, involved_sys = zip(*involved)
-        except ValueError:
-            # If not enough values to unpack, that means involved was empty
+        if len(involved) == 0:
             return not_involved
 
         sw_hamiltonian = not_involved
-        involved_coefs = np.fromiter(involved_coefs, dtype=float)
-        involved_opssys = [(tuple(x), tuple(y))
-                           for x, y in zip(involved_ops, involved_sys)]
 
-        # Filter out very small contributions
-        mask = (np.abs(involved_coefs) > 1e-6)
-        involved_coefs = involved_coefs[mask]
-        involved_opssys = [involved_opssys[sv_index]
-                           for sv_index in range(len(involved_opssys)) if mask[sv_index]]
+        # partitions is a list of elements of structure
+        #   (<partition>, (<coef, term> pairs))
+        # where <partition> is a tuple indicating the terms to consider together,
+        # <coef> is the actual coefficient to consider for each hamiltonian term and
+        # <term> is the index to the corresponding hamiltonian term
+        partitions = cextension.find_used_partitions(
+            involved, available_ancilla, locality)
+            
+        for partition_systems, terms_indirect in partitions:
+            involved_coefs = [x[0] for x in terms_indirect]
+            involved_opssys = [involved[x[1]][1:] for x in terms_indirect]
 
-        if len(involved_coefs) == 0:
-            return not_involved
+            # Perform the actual reduction
+            system_cutoff = len(partition_systems)//2
+            low_space = partition_systems[:system_cutoff]
+            high_space = partition_systems[system_cutoff:]
+            operators = ('x', 'y', 'z', 'i')
 
-        # Perform the actual reduction
-        system_cutoff = len(systems_to_reduce)//2
-        low_space = systems_to_reduce[:system_cutoff]
-        high_space = systems_to_reduce[system_cutoff:]
-        operators = ('x', 'y', 'z', 'i')
+            # Build the matrix C
+            row = []
+            col = []
+            values = []
+            for low_index, low_operators in enumerate(itertools.product(operators, repeat=len(low_space))):
+                for high_index, high_operators in enumerate(itertools.product(operators, repeat=len(high_space))):
+                    # We can skip the full identity, as we know this will
+                    # never be in the list of terms to reduce!
+                    full_operators = low_operators + high_operators
+                    if len(full_operators) * ('i',) == full_operators:
+                        continue
 
-        # Build the matrix C
-        row = []
-        col = []
-        values = []
-        for low_index, low_operators in enumerate(itertools.product(operators, repeat=len(low_space))):
-            for high_index, high_operators in enumerate(itertools.product(operators, repeat=len(high_space))):
-                # We can skip the full identity, as we know this will
-                # never be in the list of terms to reduce!
-                full_operators = low_operators + high_operators
-                if len(full_operators) * ('i',) == full_operators:
+                    # Look for this (operators, systems) pair
+                    try:
+                        term_index = involved_opssys.index(
+                            [list(full_operators), list(partition_systems)])
+                    except ValueError:
+                        continue
+
+                    row.append(low_index)
+                    col.append(high_index)
+                    values.append(involved_coefs[term_index])
+
+            # We will need an ancilla for each singular value
+            c = scipy.sparse.coo_matrix((values, (row, col)), shape=(
+                len(operators)**len(low_space), len(operators)**len(high_space))).tocsr()
+            u, s, vt = scipy.sparse.linalg.svds(
+                c, return_singular_vectors=True, ncv=25, which='LM')
+
+            # The operator can be written as Sum(Tensor(u[i], s[i]*vt[i].T) for i)
+            for sv_index in range(s.shape[0]):
+                if abs(s[sv_index]) < CUTOFF:
                     continue
 
-                # Build the (<operators>, <systems>) pair to look for in `involved`
-                ops_sys = tuple(zip(*filter(lambda x: x[0] != 'i', zip(
-                    full_operators, systems_to_reduce))))
+                # ui and vi contain the coefficients for the low and high spaces
+                uk = u[:, sv_index]
+                vk = vt[sv_index, :] * s[sv_index]
 
-                try:
-                    term_index = involved_opssys.index(ops_sys)
-                except ValueError:
-                    continue
+                # Convert uk, vk into the operator form
+                # See that if our "components" are ('x', 'y', 'z', 'i')
+                # And we're producing e.g. 3-sized combinatitions in order
+                # 0 --> xxx
+                # 1 --> xxy
+                # 2 --> xxz
+                # 3 --> xxi
+                # 4 --> xyx
+                # etc.
+                # Then the it works essentially as a `components`-sized decimal system
+                # and the "digit" at position `j` (right-to-left) of number `i` is
+                # given by `components[(i // len(components)**j) % len(components)]`
+                coupling = np.max((np.max(np.abs(uk)), np.max(np.abs(vk))))
+                low_component = [
+                    [uki, [operators[(low_index // len(operators)**(pos - 1)) % len(operators)]
+                        for pos in range(len(low_space), 0, -1)], list(low_space)]
+                    for low_index, uki in enumerate(uk)
+                    if uki != 0
+                ]
+                high_component = [
+                    [vki, [operators[(high_index // len(operators)**(pos - 1)) % len(operators)]
+                        for pos in range(len(high_space), 0, -1)], list(high_space)]
+                    for high_index, vki in enumerate(vk)
+                    if vki != 0
+                ]
 
-                row.append(low_index)
-                col.append(high_index)
-                values.append(involved_coefs[term_index])
+                # Filter both `low_component` and `high_component` from identities
+                low_component = [
+                    (
+                        [elem[0], *(list(x)
+                                    for x in zip(*filter(
+                                        lambda x: x[0] != 'i',
+                                        zip(elem[1], elem[2])
+                                    ))
+                                    )]
+                        if elem[1] != ['i']*len(elem[1]) else
+                        [elem[0], [], []]
+                    )
+                    for elem in low_component
+                ]
+                high_component = [
+                    (
+                        [elem[0], *(list(x)
+                                    for x in zip(*filter(
+                                        lambda x: x[0] != 'i',
+                                        zip(elem[1], elem[2])
+                                    ))
+                                    )]
+                        if elem[1] != ['i']*len(elem[1]) else
+                        [elem[0], [], []]
+                    )
+                    for elem in high_component
+                ]
 
-        # We will need an ancilla for each singular value
-        c = scipy.sparse.coo_matrix((values, (row, col)), shape=(
-            len(operators)**len(low_space), len(operators)**len(high_space))).tocsr()
-        u, s, vt = scipy.sparse.linalg.svds(c, return_singular_vectors=True, ncv=25, which='LM')
+                # The ancilla for this term
+                used_ancilla = available_ancilla
+                available_ancilla += 1
 
-        # The operator can be written as Sum(Tensor(u[i], s[i]*vt[i].T) for i)
-        for sv_index in range(s.shape[0]):
-            if abs(s[sv_index]) < 1e-6:
-                continue
+                local_terms = [
+                    [coupling / epsilon**2, ['|1><1|'], [used_ancilla]],
+                    *(
+                        [-sqrt(coupling/2)/epsilon*uki,
+                        [*ops, 'x'], [*space, used_ancilla]]
+                        for uki, ops, space in low_component
+                        if abs(sqrt(coupling/2)/epsilon*uki) > CUTOFF
+                    ),
+                    *(
+                        [coef/2, ops, space]
+                        for coef, ops, space in determine_square(low_component)
+                        if abs(coef/2) > CUTOFF
+                    ),
+                    *(
+                        [sqrt(coupling/2)/epsilon*vki,
+                        [*ops, 'x'], [*space, used_ancilla]]
+                        for vki, ops, space in high_component
+                        if abs(sqrt(coupling/2)/epsilon*vki) > CUTOFF
+                    ),
 
-            # ui and vi contain the coefficients for the low and high spaces
-            uk = u[:, sv_index]
-            vk = vt[sv_index, :] * s[sv_index]
-
-            # Convert uk, vk into the operator form
-            # See that if our "components" are ('x', 'y', 'z', 'i')
-            # And we're producing e.g. 3-sized combinatitions in order
-            # 0 --> xxx
-            # 1 --> xxy
-            # 2 --> xxz
-            # 3 --> xxi
-            # 4 --> xyx
-            # etc.
-            # Then the it works essentially as a `components`-sized decimal system
-            # and the "digit" at position `j` (right-to-left) of number `i` is
-            # given by `components[(i // len(components)**j) % len(components)]`
-            coupling = np.max((np.max(np.abs(uk)), np.max(np.abs(vk))))
-            low_component = [
-                [uki, [operators[(low_index // len(operators)**(pos - 1)) % len(operators)]
-                       for pos in range(len(low_space), 0, -1)], list(low_space)]
-                for low_index, uki in enumerate(uk)
-                if uki != 0
-            ]
-            high_component = [
-                [vki, [operators[(high_index // len(operators)**(pos - 1)) % len(operators)]
-                       for pos in range(len(high_space), 0, -1)], list(high_space)]
-                for high_index, vki in enumerate(vk)
-                if vki != 0
-            ]
-
-            # Filter both `low_component` and `high_component` from identities
-            low_component = [
-                (
-                    [elem[0], *(list(x)
-                                for x in zip(*filter(
-                                    lambda x: x[0] != 'i',
-                                    zip(elem[1], elem[2])
-                                ))
-                                )]
-                    if elem[1] != ['i']*len(elem[1]) else
-                    [elem[0], [], []]
-                )
-                for elem in low_component
-            ]
-            high_component = [
-                (
-                    [elem[0], *(list(x)
-                                for x in zip(*filter(
-                                    lambda x: x[0] != 'i',
-                                    zip(elem[1], elem[2])
-                                ))
-                                )]
-                    if elem[1] != ['i']*len(elem[1]) else
-                    [elem[0], [], []]
-                )
-                for elem in high_component
-            ]
-
-            # The ancilla for this term
-            used_ancilla = available_ancilla
-            available_ancilla += 1
-
-            low_reduced = decimate([
-                *(
-                    [-sqrt(coupling/2)/epsilon*uki,
-                     [*ops, 'x'], [*space, used_ancilla]]
-                    for uki, ops, space in low_component
-                ),
-                *(
-                    [coef/2, ops, space]
-                    for coef, ops, space in determine_square(low_component)
-                )
-            ])
-            high_reduced = decimate([
-                *(
-                    [sqrt(coupling/2)/epsilon*vki,
-                     [*ops, 'x'], [*space, used_ancilla]]
-                    for vki, ops, space in high_component
-                ),
-                
-                *(
-                    [coef/2, ops, space]
-                    for coef, ops, space in determine_square(high_component)
-                )
-            ])
-
-            local_terms = [
-                [coupling / epsilon**2, ['|1><1|'], [used_ancilla]],
-                *low_reduced,
-                *high_reduced,
-            ]
-            local_terms.sort(key=lambda term: term[1:])
-            local_terms = list(
-                map(
-                    lambda kg: [sum(x[0] for x in kg[1]), *kg[0]],
-                    itertools.groupby(
-                        local_terms,
-                        key=lambda coef_ops_sys: coef_ops_sys[1:])))
-            sw_hamiltonian.extend(decimate(local_terms))
+                    *(
+                        [coef/2, ops, space]
+                        for coef, ops, space in determine_square(high_component)
+                        if abs(coef/2) > CUTOFF
+                    ),
+                ]
+                sw_hamiltonian.extend(local_terms)
 
         sw_hamiltonian.sort(key=lambda term: term[1:])
         sw_hamiltonian = list(
@@ -443,7 +426,7 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
                     sw_hamiltonian,
                     key=lambda coef_ops_sys: coef_ops_sys[1:])))
 
-        return sw_hamiltonian
+        return decimate(sw_hamiltonian, locality//2+1 if locality % 2 == 0 else locality//2+2)
 
     # Read the hamiltonian file;
     # Get from the file:
@@ -463,8 +446,11 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
             term = parse_hamiltonian_line(line)
             hamiltonian_terms.append(term)
 
+    if largest_coupling is None:
+        raise Exception("Could not read largest coupling")
+
     # Returns: Hamiltonian terms, number of systems involved
-    return decimate(hamiltonian_terms), available_ancilla
+    return decimate(hamiltonian_terms, available_ancilla), available_ancilla
 
 
 def schrieffer_wolff_legacy(hamiltonian_file, max_locality):
@@ -636,9 +622,9 @@ def matrix_from_terms(hamiltonian, num_systems):
 
 
 def ground_state_from_terms(hamiltonian, num_systems):
-    #return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
+    # return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
     #                                        k=1, which='SA', return_eigenvectors=False))
-    return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems), which='SA', return_eigenvectors=False))
+    return np.min(np.linalg.eigvalsh(matrix_from_terms(hamiltonian, num_systems).todense()))
 
 
 if __name__ == '__main__':
