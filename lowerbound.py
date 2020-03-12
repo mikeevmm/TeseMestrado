@@ -928,7 +928,7 @@ if __name__ == '__main__':
             debugio.write("# length exact decomposed\n")
             for file in tqdm(glob(f"{output_directory}/*.hamiltonian")):
                 print(file)
-                decomposed, system_num = schrieffer_wolff_legacy(file, qubits, klargest)
+                decomposed, system_num = schrieffer_wolff_legacy(file, qubits)
                 approx = ground_state_from_terms(
                     decomposed,
                     system_num,
