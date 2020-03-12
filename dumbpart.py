@@ -81,6 +81,8 @@ if __name__ == "__main__":
     # Write the results into the outfile
     outfile = arguments['--outfile']
     with open(outfile, 'w') as outfile_io:
+        for argument in arguments:
+            outfile_io.write(f"# {argument}: {arguments[argument]}\n")
         outfile_io.write("# <filename> \t <lower bound>\t<discarding> \n")
         for filename, lb, dsc in filename_lb_pairs:
             outfile_io.write(f"{filename}\t{lb}\t{dsc}\n")
