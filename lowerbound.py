@@ -1,37 +1,5 @@
 #!/usr/bin/env python3
-
-import itertools
-import json
-import os
-import random
-import re
-from bisect import bisect_left
-from collections import defaultdict
-from functools import reduce
-from glob import glob
-from itertools import chain
-
-import h5py
-import numpy as np
-import pathos.multiprocessing as mp
-import qop
-import scipy
-import scipy.optimize
-from more_itertools import partition
-from numpy import abs, ceil, sqrt
-from openfermion.hamiltonians import MolecularData
-from openfermion.ops import QubitOperator
-from openfermion.transforms import (get_fermion_operator, get_sparse_operator,
-                                    jordan_wigner)
-from openfermion.utils import get_ground_state
-from openfermionpsi4 import run_psi4
-from tqdm import tqdm
-
-import cextension
-
-STRETCH = 1
-
-__doc__ = """\
+"""\
 Calculate a lower bound energy for a molecule.
 
 Usage:
@@ -71,20 +39,44 @@ Options:
                                 this will likely crash the computer in
                                 trying to diagonalize the exact
                                 hamiltonian!
+      --no-variational          Determine the ground state energy using
+                                numpy/scipy's eigenvalue functions,
+                                rather than simulating a variational
+                                eigensolver.
 """
 
 
-class NpEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        else:
-            return super(NpEncoder, self).default(obj)
+import itertools
+import json_tricks as json
+import os
+import random
+import re
+from bisect import bisect_left
+from collections import defaultdict
+from functools import reduce
+from glob import glob
+from itertools import chain
 
+import h5py
+import numpy as np
+import pathos.multiprocessing as mp
+import qop
+import scipy
+import scipy.optimize
+from more_itertools import partition
+from numpy import abs, ceil, sqrt
+from openfermion.hamiltonians import MolecularData
+from openfermion.ops import QubitOperator
+from openfermion.transforms import (get_fermion_operator, get_sparse_operator,
+                                    jordan_wigner)
+from openfermion.utils import get_ground_state
+from openfermionpsi4 import run_psi4
+from tqdm import tqdm
+
+import cextension
+import qop
+
+STRETCH = 1
 
 # Define parsing a line of a hamiltonian file
 
@@ -92,6 +84,8 @@ class NpEncoder(json.JSONEncoder):
 term_re = re.compile(
     r"\(?(.+?)\)? *\[([XYZ\d ]*)\](?: \+)?")
 operator_re = re.compile(r"([XYZ])(\d+)")
+filename_pat = re.compile(
+    r'[a-zA-Z0-9]+_[a-zA-Z0-9\-]+_\(([0-9\.]+),\).+')
 
 
 def parse_hamiltonian_line(line):
@@ -121,9 +115,45 @@ def parse_hamiltonian_line(line):
 
 
 epsilon = 0.1
+CUTOFF = 1e-6
 
 
-def schrieffer_wolff(hamiltonian_file, max_locality):
+def prod_sigmas(a, b):
+    if a == 'i':
+        return 1, b
+    if b == 'i':
+        return 1, a
+    if a == 'x':
+        if b == 'x':
+            return 1, 'i'
+        if b == 'y':
+            return 1j, 'z'
+        if b == 'z':
+            return -1j, 'y'
+    if a == 'y':
+        if b == 'x':
+            return -1j, 'z'
+        if b == 'y':
+            return 1, 'i'
+        if b == 'z':
+            return 1j, 'x'
+    if a == 'z':
+        if b == 'x':
+            return 1j, 'y'
+        if b == 'y':
+            return -1j, 'x'
+        if b == 'z':
+            return 1, 'i'
+
+
+def commute_sigmas(a, b):
+    if a == 'i' or b == 'i' or a == b:
+        return 0, 'i'
+    factor, op = prod_sigmas(a, b)
+    return 2.*factor, op
+
+
+def schrieffer_wolff(hamiltonian_file, max_locality, k_largest=1):
     if max_locality == 2:
         raise Exception("Max locality of 2 not implemented!")
 
@@ -132,287 +162,287 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
     # TODO: Go over this code very carefully. I'm not entirely sure
     # it's correct.
     def determine_square(terms):
-        squared = [[sum(coef**2 for coef, _, _ in terms), [], []]]
+        squared = []
 
-        # Find the cross terms contributions
-        # (`itertools.combinations` is in lexical order)
-        # `left` and `right` correspond to the `i` and `j` terms in the sum
-        # for left, right in itertools.combinations(terms, r=2):
-        for i, left in enumerate(terms):
-            for right in terms[:i]:
-                # If the terms differ in an even number of
-                # operators, 2k, there is a term ~(-1)^k
-                # We need to build the "common" set of operators/systems
-                systems = []
-                left_ops = []
-                right_ops = []
+        # "self-interaction" contribution
+        squared.append([sum(coef**2 for coef, _, _ in terms), [], []])
+
+        # Cross terms contribution
+        for i in range(len(terms)):
+            for j in range(i):
+                # Match the terms in systems
+                left = [terms[i][0], [], []]
+                right = [terms[j][0], [], []]
 
                 left_ptr = 0
                 right_ptr = 0
-                while left_ptr < len(left[1]) or right_ptr < len(right[1]):
-                    if left_ptr < len(left[2]):
-                        # Within bounds to left
-                        if right_ptr < len(right[2]):
-                            # Within bounds to right
-                            if left[2][left_ptr] < right[2][right_ptr]:
-                                systems.append(left[2][left_ptr])
-                                left_ops.append(left[1][left_ptr])
-                                right_ops.append('i')
-                                left_ptr += 1
-                            elif right[2][right_ptr] < left[2][left_ptr]:
-                                systems.append(right[2][right_ptr])
-                                left_ops.append('i')
-                                right_ops.append(right[1][right_ptr])
-                                right_ptr += 1
-                            else:
-                                systems.append(left[2][left_ptr])
-                                left_ops.append(left[1][left_ptr])
-                                right_ops.append(right[1][right_ptr])
-                                left_ptr += 1
-                                right_ptr += 1
-                        else:
-                            # Outside bounds to right;
-                            # add the rest of left
-                            systems.extend(left[2][left_ptr:])
-                            right_ops.extend(
-                                ('i',)*(len(left[2]) - left_ptr))
-                            left_ops.extend(left[1][left_ptr:])
-                            break
+                while left_ptr < len(terms[i][2]) or right_ptr < len(terms[j][2]):
+                    if left_ptr >= len(terms[i][2]):
+                        # Only right operators remain
+                        remaining_sys = terms[j][2][right_ptr:]
+                        right[1].extend(terms[j][1][right_ptr:])
+                        right[2].extend(remaining_sys)
+                        left[1].extend(['i']*len(remaining_sys))
+                        left[2].extend(remaining_sys)
+                        right_ptr = len(terms[j][2])
+                    elif right_ptr >= len(terms[j][2]):
+                        # Only left operators remain
+                        remaining_sys = terms[i][2][left_ptr:]
+                        left[1].extend(terms[i][1][left_ptr:])
+                        left[2].extend(remaining_sys)
+                        right[1].extend(['i']*len(remaining_sys))
+                        right[2].extend(remaining_sys)
+                        left_ptr = len(terms[i][2])
                     else:
-                        # Outside bounds to left;
-                        # add the rest of right
-                        systems.extend(right[2][right_ptr:])
-                        left_ops.extend(('i',)*(len(right[2]) - right_ptr))
-                        right_ops.extend(right[1][right_ptr:])
-                        break
+                        # Operators of both terms remain
+                        left_op = 'i'
+                        right_op = 'i'
+                        cur_sys = min(terms[i][2][left_ptr],
+                                      terms[j][2][right_ptr])
+                        if terms[i][2][left_ptr] == cur_sys:
+                            left_op = terms[i][1][left_ptr]
+                            left_ptr += 1
+                        if terms[j][2][right_ptr] == cur_sys:
+                            right_op = terms[j][1][right_ptr]
+                            right_ptr += 1
+                        left[1].append(left_op)
+                        left[2].append(cur_sys)
+                        right[1].append(right_op)
+                        right[2].append(cur_sys)
 
-                if len(left_ops) == 0:  # This is a scalar term
-                    assert(len(right_ops) == 0)
-                    squared.append([2*left[0]*right[0], [], []])
-                    continue
+                # Direct product
+                prod_operators = []
+                prod_systems = []
+                factor_contrib = 1
+                for left_op, right_op, sys in zip(left[1], right[1], left[2]):
+                    factor, prod = prod_sigmas(left_op, right_op)
+                    factor_contrib *= factor
+                    if prod != 'i':
+                        prod_operators.append(prod)
+                        prod_systems.append(sys)
+                squared.append([2.*left[0]*right[0]*factor_contrib,
+                                prod_operators, prod_systems])
 
-                # If the two terms differ in an uneven number of operators,
-                # they will not contribute to the cross-term of the square
-                # Note that identities do not "count" in terms of flipping
-                # the sign, so there must be an even number of differences
-                # *not* with the identity for the term not to disappear
-                ops_arr = np.array([left_ops, right_ops])
-                systems = np.array(systems)
-                not_in_common = ((ops_arr[0, :] != 'i') &
-                                 (ops_arr[1, :] != 'i') &
-                                 (ops_arr[0, :] != ops_arr[1, :])).sum()
-                if not_in_common % 2 != 0:
-                    continue
+                # Commutator contribution products
+                # Identify matching pairs of Pauli operators with
+                # nonzero commutator
+                matching = [k for k in range(len(left[2]))
+                            if left[1][k] != 'i'
+                            and right[1][k] != 'i'
+                            and left[1][k] != right[1][k]]
 
-                # Build the contribution
-                # TODO: I am doing this naive-ly, because I couldn't find
-                # any clever way to do it.
-                different = (ops_arr[0, :] != ops_arr[1, :])
-                contrib_sign = 1 if ((not_in_common//2) %
-                                     2 == 0) else -1  # from i^(2k)
-                contrib_coef = contrib_sign*2*left[0]*right[0]
-                contrib_ops = []
-                contrib_sys = []
-                for op_a, op_b, sys in zip(ops_arr[0, different],
-                                           ops_arr[1, different],
-                                           systems[different]):
-                    contrib_sys.append(sys)
-                    if op_a == 'i':
-                        contrib_ops.append(op_b)
-                    elif op_b == 'i':
-                        contrib_ops.append(op_a)
-                    elif op_a == 'x':
-                        if op_b == 'y':
-                            contrib_ops.append('z')
-                        else:
-                            assert(op_b == 'z')
-                            contrib_sign *= -1
-                            contrib_ops.append('y')
-                    elif op_a == 'y':
-                        if op_b == 'z':
-                            contrib_ops.append('x')
-                        else:
-                            assert(op_b == 'x')
-                            contrib_sign *= -1
-                            contrib_ops.append('z')
-                    elif op_a == 'z':
-                        if op_b == 'x':
-                            contrib_ops.append('y')
-                        else:
-                            assert(op_b == 'y')
-                            contrib_sign *= -1
-                            contrib_ops.append('x')
-                squared.append([contrib_coef, contrib_ops, contrib_sys])
+                for pair_count in range(1, len(matching)+1):
+                    for to_commute in itertools.combinations(matching, r=pair_count):
+                        # Consider the term in which the system(s) in `to_commute`
+                        # has its operator as a result of commutation of operators
+                        # in left and right
+                        comm_sign = 1 if (pair_count % 2 == 0) else -1
+                        term_coef = left[0]*right[0]*comm_sign
+                        operators = []
+                        systems = []
+                        for op_left, op_right, system in zip(left[1], right[1], left[2]):
+                            if system in to_commute:
+                                comm_factor, comm_op = commute_sigmas(
+                                    op_left, op_right)
+                                term_coef *= comm_factor
+                                if comm_op != 'i':
+                                    operators.append(comm_op)
+                                    systems.append(system)
+                            else:
+                                prod_factor, prod_op = prod_sigmas(
+                                    op_left, op_right)
+                                term_coef *= prod_factor
+                                if prod_op != 'i':
+                                    operators.append(prod_op)
+                                    systems.append(system)
+                        squared.append([term_coef, operators, systems])
 
         # Remove redundant terms!
         squared.sort(key=lambda term: term[1:])
         squared = list(
-            map(
+            filter(lambda x: np.linalg.norm(x[0]) > CUTOFF,
+                   map(
                 lambda kg: [sum(x[0] for x in kg[1]), *kg[0]],
                 itertools.groupby(
                     squared,
-                    key=lambda coef_ops_sys: coef_ops_sys[1:])))
+                    key=lambda coef_ops_sys: coef_ops_sys[1:])
+            ))
+        )
         return squared
 
-    def decimate(terms):
+    def decimate(terms, locality):
         nonlocal max_locality, available_ancilla
         # `terms` is a collection of items with structure
         # (<coef>, [<operator>], [<system index>])
         # representing a hamiltonian that is the sum of all
         # these items.
-        # These terms are **not reduced**
 
-        # We can ignore all terms that are below the intended locality
-        not_involved, involved = partition(
-            lambda term: len(term[2]) > max_locality, terms)
-        not_involved = [list(x) for x in not_involved]
-        involved = list(involved)
+        terms = list(filter(lambda term: np.linalg.norm(term[0]) > CUTOFF, terms))
 
-        # Find out what systems are involved in the terms to be reduced
-        systems_to_reduce = np.unique(
-            list(sum((term[2] for term in involved), [])))
+        if locality <= max_locality:
+            return terms
 
-        try:
-            involved_coefs, involved_ops, involved_sys = zip(*involved)
-        except ValueError:
-            # If not enough values to unpack, that means involved was empty
-            return not_involved
+        sw_hamiltonian = []
 
-        involved_coefs = np.fromiter(involved_coefs, dtype=float)
-        involved_opssys = [(tuple(x), tuple(y))
-                           for x, y in zip(involved_ops, involved_sys)]
+        # partitions is a list of elements of structure
+        #   (<partition>, (<coef, term> pairs))
+        # where <partition> is a tuple indicating the terms to consider together,
+        # <coef> is the actual coefficient to consider for each hamiltonian term and
+        # <term> is the index to the corresponding hamiltonian term
+        terms.sort(key=lambda x: len(x[2]), reverse=True)
+        partitions = cextension.find_used_partitions(
+            terms, available_ancilla, locality)
 
-        # Determine coupling
-        coupling = np.max(np.abs(involved_coefs))
+        for partition_systems, terms_indirect in partitions:
+            involved_coefs = [x[0] for x in terms_indirect]
+            involved_opssys = [terms[x[1]][1:] for x in terms_indirect]
 
-        # Filter out very small contributions
-        mask = (np.abs(involved_coefs)/coupling > 1e-6)
-        involved_coefs = involved_coefs[mask]
-        involved_opssys = [involved_opssys[i]
-                           for i in range(len(involved_opssys)) if mask[i]]
+            # Perform the actual reduction
+            # TODO: Choose the system_cutoff more wisely?
+            system_cutoff = len(partition_systems)//2
+            partition_systems = list(partition_systems)
+            low_space = partition_systems[:system_cutoff]
+            high_space = partition_systems[system_cutoff:]
+            operators = ('x', 'y', 'z', 'i')
 
-        # At this point, involved is a single JAB operator involving the systems in
-        # `systems_to_reduce` to be reduced by the k/2+1 gadget
-        # We need first to determine A and B; see `Splitting a Sum in Half` in the notes
-        system_cutoff = len(systems_to_reduce)//2
-        low_space = systems_to_reduce[:system_cutoff]
-        high_space = systems_to_reduce[system_cutoff:]
-        operators = ('x', 'y', 'z', 'i')
+            # Build the matrix C
+            row = []
+            col = []
+            values = []
+            for low_index, low_operators in enumerate(itertools.product(operators, repeat=len(low_space))):
+                for high_index, high_operators in enumerate(itertools.product(operators, repeat=len(high_space))):
+                    # We can skip the full identity, as we know this will
+                    # never be in the list of terms to reduce!
+                    full_operators = low_operators + high_operators
 
-        # Build the matrix C
-        row = []
-        col = []
-        values = []
-        for low_index, low_operators in enumerate(itertools.product(operators, repeat=len(low_space))):
-            for high_index, high_operators in enumerate(itertools.product(operators, repeat=len(high_space))):
-                # We can skip the full identity, as we know this will
-                # never be in the list of terms to reduce!
-                full_operators = low_operators + high_operators
-                if len(full_operators) * ('i',) == full_operators:
+                    # Look for this (operators, systems) pair
+                    ops = []
+                    systems = []
+                    for op, sys in zip(full_operators, partition_systems):
+                        if op != 'i':
+                            ops.append(op)
+                            systems.append(sys)
+                    pair = [ops, systems]
+
+                    try:
+                        term_index = involved_opssys.index(pair)
+                    except ValueError:
+                        continue  # Pair not in `involved_opssys`
+
+                    row.append(low_index)
+                    col.append(high_index)
+                    values.append(involved_coefs[term_index])
+
+            # We will need an ancilla for each singular value
+            c = scipy.sparse.coo_matrix((values, (row, col)), shape=(
+                len(operators)**len(low_space), len(operators)**len(high_space))).tocsr()
+            u, s, vt = scipy.sparse.linalg.svds(
+                c, return_singular_vectors=True, which='LM')
+
+            # Assert that the SVD is correct within a small error
+            # assert(abs(
+            #    np.max(
+            #        c - sum(
+            #            np.outer(u[:, i], s[i]*vt[i, :].T)
+            #            for i in range(s.shape[0])
+            #               )
+            #          )
+            #          ) < 1e-10
+            #      )
+
+            # The operator can be written as Sum(Tensor(u[i], s[i]*vt[i].T) for i)
+            key_sorted = np.argsort(-np.abs(s))
+            for sv_index in key_sorted[:k_largest] if klargest > 0 else key_sorted:
+                if abs(s[sv_index]) < 10e-10:  # Approximately 0
                     continue
 
-                # Build the (<operators>, <systems>) pair to look for in `involved`
-                ops_sys = tuple(zip(*filter(lambda x: x[0] != 'i', zip(
-                    full_operators, systems_to_reduce))))
+                # ui and vi contain the coefficients for the low and high spaces
+                uk = u[:, sv_index]
+                vk = vt[sv_index, :] * s[sv_index]
 
-                try:
-                    term_index = involved_opssys.index(ops_sys)
-                except ValueError:
-                    continue
+                coupling = np.max(np.abs(uk)) * np.max(np.abs(vk))
 
-                row.append(low_index)
-                col.append(high_index)
-                values.append(involved_coefs[term_index])
+                # Convert uk, vk into the operator form
+                # See that if our "components" are ('x', 'y', 'z', 'i')
+                # And we're producing e.g. 3-sized combinatitions in order
+                # 0 --> xxx
+                # 1 --> xxy
+                # 2 --> xxz
+                # 3 --> xxi
+                # 4 --> xyx
+                # etc.
+                # Then the it works essentially as a `components`-sized decimal system
+                # and the "digit" at position `j` (right-to-left) of number `i` is
+                # given by `components[(i // len(components)**j) % len(components)]`
+                low_component = [
+                    [uki, [operators[(low_index // len(operators)**(pos - 1)) % len(operators)]
+                           for pos in range(len(low_space), 0, -1)], low_space]
+                    for low_index, uki in enumerate(uk)
+                    if uki != 0
+                ]
+                high_component = [
+                    [vki, [operators[(high_index // len(operators)**(pos - 1)) % len(operators)]
+                           for pos in range(len(high_space), 0, -1)], high_space]
+                    for high_index, vki in enumerate(vk)
+                    if vki != 0
+                ]
 
-        sw_hamiltonian = [*not_involved]
+                # Filter both `low_component` and `high_component` from identities
+                low_component = [
+                    (
+                        [elem[0], *(list(x)
+                                    for x in zip(*filter(
+                                        lambda x: x[0] != 'i',
+                                        zip(elem[1], elem[2])
+                                    ))
+                                    )]
+                        if elem[1] != ['i']*len(elem[1]) else
+                        [elem[0], [], []]
+                    )
+                    for elem in low_component
+                ]
+                high_component = [
+                    (
+                        [elem[0], *(list(x)
+                                    for x in zip(*filter(
+                                        lambda x: x[0] != 'i',
+                                        zip(elem[1], elem[2])
+                                    ))
+                                    )]
+                        if elem[1] != ['i']*len(elem[1]) else
+                        [elem[0], [], []]
+                    )
+                    for elem in high_component
+                ]
 
-        if sum(value**2 for value in values) < 1e-5:
-            return sw_hamiltonian
+                # The ancilla for this term
+                used_ancilla = available_ancilla
+                available_ancilla += 1
 
-        # We will need an ancilla for each singular value
-        c = scipy.sparse.coo_matrix((values, (row, col)), shape=(
-            len(operators)**len(low_space), len(operators)**len(high_space))).tocsr()
+                local_terms = [
+                    [coupling / epsilon**2, ['|1><1|'], [used_ancilla]],
+                    *(
+                        [-sqrt(coupling/2)/epsilon*coef,
+                         [*ops, 'x'], [*space, used_ancilla]]
+                        for coef, ops, space in low_component
+                    ),
+                    *(
+                        [coef/2, ops, space]
+                        for coef, ops, space in determine_square(low_component)
+                    ),
+                    *(
+                        [sqrt(coupling/2)/epsilon*coef,
+                         [*ops, 'x'], [*space, used_ancilla]]
+                        for coef, ops, space in high_component
+                    ),
 
-        coefs = np.random.random_sample((len(operators)**len(low_space) + len(operators)**len(high_space),))
-        def to_min(coefs):
-            ais = scipy.sparse.csr_matrix(coefs[:len(operators)**len(low_space)])
-            bis = scipy.sparse.csr_matrix(coefs[len(operators)**len(low_space):]).transpose()
-            return scipy.sparse.linalg.norm(scipy.sparse.kron(ais, bis) - c)
+                    *(
+                        [coef/2, ops, space]
+                        for coef, ops, space in determine_square(high_component)
+                    ),
+                ]
 
-        opt_result = scipy.optimize.minimize(to_min, coefs)
-        ais = (opt_result.x)[:len(operators)**len(low_space)]
-        bis = (opt_result.x)[len(operators)**len(low_space):]
-
-        low_terms = []  # "A"
-        high_terms = []  # "B"
-
-        for low_index, low_operators in enumerate(itertools.product(operators, repeat=len(low_space))):
-            #if abs(ais[low_index]) < 1e-5:
-            #    continue
-            ops_sys = tuple(
-                zip(*filter(lambda x: x[0] != 'i', zip(low_operators, low_space))))
-            if len(ops_sys) == 0:
-                ops_sys = ([], [])
-            low_terms.append([ais[low_index] / sqrt(coupling),
-                            list(ops_sys[0]), list(ops_sys[1])])
-
-        for high_index, high_operators in enumerate(itertools.product(operators, repeat=len(high_space))):
-            #if abs(bis[high_index]) < 1e-5:
-            #    continue
-            ops_sys = tuple(zip(*filter(lambda x: x[0] != 'i', zip(
-                high_operators, high_space))))
-            if len(ops_sys) == 0:
-                ops_sys = ([], [])
-            high_terms.append(
-                [bis[high_index] / sqrt(coupling), list(ops_sys[0]), list(ops_sys[1])])
-
-        # A and B are created.
-        # NOTE that these are already the "reduced" operators, i.e. `O = JAB`
-        # Now we need to determine A² and B²
-
-        low_terms_sqrd = determine_square(low_terms)
-        high_terms_sqrd = determine_square(high_terms)
-
-        # The squared terms have been determined, we may now create the
-        # Schrieffer-Wolff hamiltonian.
-
-        used_ancilla = available_ancilla
-        available_ancilla += 1
-
-        # [[coupling/epsilon**2/2, ['|1><1|'], [used_ancilla]]] + \
-        sw_low = \
-            [[-0.707106781*coupling**2*term[0]/epsilon, [*term[1], 'x'],
-                [*term[2], used_ancilla]]
-                for term in low_terms] + \
-            [[0.5*term[0]*coupling, term[1], term[2]]
-                for term in low_terms_sqrd]
-
-        # [[coupling/epsilon**2/2, ['|1><1|'], [used_ancilla]]] + \
-        sw_high = \
-            [[0.707106781*coupling**2*term[0]/epsilon, [*term[1], 'x'],
-                [*term[2], used_ancilla]]
-                for term in high_terms] + \
-            [[0.5*term[0]*coupling, term[1], term[2]]
-                for term in high_terms_sqrd]
-
-        # We can't just re-decimate the resulting sw_hamiltonian;
-        # To see why, take for example
-        #   H = H_{12345} = H_{123} + H_{45}
-        # It is favourable to consider the sum as a single term,
-        # because then only a single ancilla is introduced.
-        # However, the resulting reduced-locality hamiltonian
-        #   J.H_{123}.H_{45} -> ~H_{123u} + H_{45u}
-        # is so that if we try again take the sum as a whole, we
-        # actually go up in the body count (H_{12345u}).
-        sw_low = decimate(sw_low)
-        sw_high = decimate(sw_high)
-
-        # Finally, re-clean
-        sw_hamiltonian.extend([
-            [coupling**3/epsilon**2, ['|1><1|'], [used_ancilla]],
-            *sw_low,
-            *sw_high,
-        ])
+                sw_hamiltonian.extend(local_terms)
 
         sw_hamiltonian.sort(key=lambda term: term[1:])
         sw_hamiltonian = list(
@@ -422,7 +452,7 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
                     sw_hamiltonian,
                     key=lambda coef_ops_sys: coef_ops_sys[1:])))
 
-        return sw_hamiltonian
+        return decimate(sw_hamiltonian, locality//2+1 if locality % 2 == 0 else locality//2+2)
 
     # Read the hamiltonian file;
     # Get from the file:
@@ -443,7 +473,7 @@ def schrieffer_wolff(hamiltonian_file, max_locality):
             hamiltonian_terms.append(term)
 
     # Returns: Hamiltonian terms, number of systems involved
-    return decimate(hamiltonian_terms), available_ancilla
+    return decimate(hamiltonian_terms, available_ancilla), available_ancilla
 
 
 def schrieffer_wolff_legacy(hamiltonian_file, max_locality):
@@ -614,9 +644,44 @@ def matrix_from_terms(hamiltonian, num_systems):
     return total_hamiltonian
 
 
-def ground_state_from_terms(hamiltonian, num_systems):
-    return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
-                                            k=1, which='SA', return_eigenvectors=False))
+def ansatz(nqubits, nlayers):
+    c = qop.Circuit(nqubits)
+    ry_gates = []
+    for _ in range(nlayers):
+        for i in range(2):
+            for qubit in range(nqubits):
+                ry = qop.Gate('ry', parameters=[
+                    (random.random() - 0.5) * 2 * 3.1415926])
+                c.add_gate(ry, qubit)
+                ry_gates.append(ry)
+            for qubit in range(0, nqubits, 2):
+                z = qop.Gate('z')
+                c.add_gate(z, (qubit + i) % nqubits, (qubit + i + 1) % nqubits)
+    for qubit in range(nqubits):
+        ry = qop.Gate('ry', parameters=[
+                      (random.random() - 0.5) * 2 * 3.1415926])
+        ry_gates.append(ry)
+        c.add_gate(ry, qubit)
+    return c, ry_gates
+
+
+def ground_state_from_terms(hamiltonian, num_systems, analytical=False, circuit=None, gates=None):
+    if analytical:
+        # return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
+        #                                        k=1, which='SA', return_eigenvectors=False))
+        return np.min(np.linalg.eigvalsh(matrix_from_terms(hamiltonian, num_systems).todense()))
+    else:
+        # Simulate a variational eigensolver
+        matrix = matrix_from_terms(hamiltonian, num_systems)
+
+        def eval(theta):
+            for param, gate in zip(theta, gates):
+                gate.reparameterize((param,))
+            out = np.array(circuit.run([1] + [0] * (2**num_systems - 1)))
+            return (np.conjugate(out.T) @ matrix @ out).real
+        optres = scipy.optimize.minimize(
+            eval, [gate.get_parameters() for gate in gates])
+        return optres.fun
 
 
 if __name__ == '__main__':
@@ -665,6 +730,7 @@ if __name__ == '__main__':
             "stop":
         },
         "epsilon": ,
+        "klargest": 1,
         "sfc": ,
         "mp2": ,
         "cisd": ,
@@ -718,6 +784,7 @@ if __name__ == '__main__':
     active_space_stop = molecule_json['simulation']['active_space'].get(
         'stop', None)
     epsilon = molecule_json['simulation']['epsilon']
+    klargest = molecule_json['simulation'].get('klargest', 1)
 
     # Set calculation parameters.
     run_scf = molecule_json['simulation']['sfc']
@@ -729,6 +796,9 @@ if __name__ == '__main__':
     # Set quantum circuit parameters
     qubits = molecule_json['circuit']['qubits']
     layers = molecule_json['circuit']['layers']
+
+    # Prepare a quantum circuit for variational eigensolving
+    circuit, circuit_rys = ansatz(qubits, layers)
 
     def get_filename(molecule_name, basis, *rest):
         return f"{output_directory}/{molecule_name}_{basis}_{rest}.molecule"
@@ -858,8 +928,13 @@ if __name__ == '__main__':
             debugio.write("# length exact decomposed\n")
             for file in tqdm(glob(f"{output_directory}/*.hamiltonian")):
                 print(file)
-                decomposed, system_num = schrieffer_wolff(file, qubits)
-                approx = ground_state_from_terms(decomposed, system_num)
+                decomposed, system_num = schrieffer_wolff_legacy(file, qubits, klargest)
+                approx = ground_state_from_terms(
+                    decomposed,
+                    system_num,
+                    True,
+                    None,
+                    None)
                 print("Approx. ground state energy:")
                 print(approx)
 
@@ -889,7 +964,7 @@ if __name__ == '__main__':
     if not skip:
         print("Calculating Schrieffer-Wolff decomposition...", flush=True)
         for hamiltonian_file in tqdm(glob(f"{output_directory}/*.hamiltonian")):
-            sw, system_num = schrieffer_wolff(hamiltonian_file, qubits)
+            sw, system_num = schrieffer_wolff_legacy(hamiltonian_file, qubits)
             sw.sort(key=lambda x: x[2])
 
             with open(f"{hamiltonian_file}.sw", 'w') as outfile:
@@ -900,7 +975,7 @@ if __name__ == '__main__':
                     '# Schrieffer-Wolff decomposition as JSON follows:\n')
                 json.dump([
                     (sum(x[0] for x in g), *k) for k, g in itertools.groupby(sw, key=lambda x: x[1:])
-                ], outfile, cls=NpEncoder)
+                ], outfile)
 
     # Performing aggregation of terms:
     # There is only one possible partitioning of a `n`-qubit system at a max locality
@@ -943,7 +1018,8 @@ if __name__ == '__main__':
                         sw_file.seek(rewind)
                         break
 
-                sw = json.loads(sw_file.read())
+                sw = [[complex(x), y, z]
+                    for x, y, z in json.loads(sw_file.read())]
 
             # Split terms into partitions; if a term fits in more than one partition,
             # distribute it equally
@@ -1047,13 +1123,16 @@ if __name__ == '__main__':
                 "filename_index", (partitioned_file_count,), dtype=h5py.string_dtype())
 
             print("Calculating lower bounds...")
-            for i, partitioned in tqdm(enumerate(glob(f"{output_directory}/*.partitioned"))):
+            # Do this in bond length order
+            bl_ordered = sorted(glob(f"{output_directory}/*.partitioned"),
+                                key=lambda fn: float(filename_pat.search(fn).group(1)))
+            for i, partitioned in tqdm(enumerate(bl_ordered)):
                 intermediate["filename_index"][i] = partitioned
 
                 with open(partitioned) as partitioned:
                     partitioned = json.load(partitioned)
 
-                    hamiltonian = partitioned['hamiltonian']
+                    hamiltonian = [[complex(x), y, z] for x,y,z in partitioned['hamiltonian']]
                     partitions = partitioned['partitions']
                     split = partitioned['split']
 
@@ -1063,10 +1142,14 @@ if __name__ == '__main__':
                     partition, terms = args
                     return ground_state_from_terms(
                         map(lambda x: (x[0], x[1], [partition.index(y) for y in x[2]]),
-                            map(lambda x: (x[0], *hamiltonian[x[1]][1:]), terms)), len(partition))
+                            map(lambda x: (x[0], *hamiltonian[x[1]][1:]), terms)),
+                        len(partition),
+                        '--no-variational' in arguments,
+                        circuit,
+                        circuit_rys)
 
                 lower_bound = sum(map(mp_lowerbound, zip(partitions, split)))
-                #lower_bound = sum(
+                # lower_bound = sum(
                 #    pool.map(mp_lowerbound, zip(partitions, split)))
 
                 def mp_lowerbound_nopart(term):
@@ -1074,14 +1157,14 @@ if __name__ == '__main__':
                         return term[0]
                     keyed_term = [term[0], term[1], [
                         i for i in range(len(term[2]))]]
-                    matrix = matrix_from_terms([keyed_term], len(term[2])).todense()
+                    matrix = matrix_from_terms(
+                        [keyed_term], len(term[2])).todense()
                     return np.min(np.linalg.eigvalsh(matrix))
-                
-                lower_bound_nopart = sum(map(mp_lowerbound_nopart, hamiltonian))
-                #lower_bound_nopart = sum(
-                #    pool.map(mp_lowerbound_nopart, hamiltonian))                
 
-                
+                lower_bound_nopart = sum(
+                    map(mp_lowerbound_nopart, hamiltonian))
+                # lower_bound_nopart = sum(
+                #    pool.map(mp_lowerbound_nopart, hamiltonian))
 
                 """
                 for partition, terms in zip(partitions, split):
@@ -1092,9 +1175,11 @@ if __name__ == '__main__':
                         terms, len(partition))
                     lower_bound += local_ground_state
                 """
-
+                
                 intermediate["lower_bounds"][i] = lower_bound
-                intermediate["lower_bounds_nopart"][i] = lower_bound_nopart
+                if abs(lower_bound_nopart.imag) > 1e-10:
+                    raise Exception("Lower bounds (no partition) is significantly complex!")
+                intermediate["lower_bounds_nopart"][i] = lower_bound_nopart.real
 
             with open(f"{molecule_name}.txt", 'w') as output:
                 def get_hartree_fock(filename):
@@ -1105,8 +1190,6 @@ if __name__ == '__main__':
                             if line.startswith('#!HF-energy'):
                                 return float(line[len('#!HF-energy'):])
 
-                filename_pat = re.compile(
-                    r'[a-zA-Z0-9]+_[a-zA-Z0-9\-]+_\(([0-9\.]+),\).+')
                 get_length = np.vectorize(lambda s: float(
                     filename_pat.search(s).group(1)))
                 lengths = get_length(intermediate['filename_index'][:])
