@@ -509,7 +509,7 @@ def schrieffer_wolff_legacy(hamiltonian_file, max_locality):
 
         # Already under max_locality? Return hamiltonian as is
         if k <= max_locality:
-            return [(coef, tuple(operators), tuple(systems))]
+            return [[coef, list(operators), list(systems)]]
 
         # Because the work of Bravyi et al. seems to assume that
         # the coupling is, by definition, positive, I here redefine
@@ -531,18 +531,18 @@ def schrieffer_wolff_legacy(hamiltonian_file, max_locality):
 
             delta = coef/epsilon**3
             new_terms = [
-                (delta, ('|1><1|',), (ancilla_qubit,)),  # H_0
-                (-delta**(2/3)*coef**(1/3), (c_operator, '|1><1|'),
-                    (c_system, ancilla_qubit)),  # V_d
-                (-sign*delta**(2/3)*coef**(1/3)/np.sqrt(2), (a_operator, 'x'),
-                    (a_system, ancilla_qubit)),  # V_od; term associated with -A
-                (delta**(2/3)*coef**(1/3)/np.sqrt(2), (b_operator, 'x'),
-                    (b_system, ancilla_qubit)),  # V_od; term associated with B
+                [delta, ['|1><1|'], [ancilla_qubit]],  # H_0
+                [-delta**(2/3)*coef**(1/3), [c_operator, '|1><1|'],
+                    [c_system, ancilla_qubit]],  # V_d
+                [-sign*delta**(2/3)*coef**(1/3)/np.sqrt(2), [a_operator, 'x'],
+                    [a_system, ancilla_qubit]],  # V_od; term associated with -A
+                [delta**(2/3)*coef**(1/3)/np.sqrt(2), [b_operator, 'x'],
+                    [b_system, ancilla_qubit]],  # V_od; term associated with B
                 # V_extra terms
-                (-sign*delta**(1/3)*coef**(2/3),
-                    (a_operator, b_operator), (a_system, b_system)),
-                (coef, (c_operator,), (c_system,)),
-                (delta**(1/3)*coef**(2/3), (), ())
+                [-sign*delta**(1/3)*coef**(2/3),
+                    [a_operator, b_operator], [a_system, b_system]],
+                [coef, [c_operator], [c_system]],
+                [delta**(1/3)*coef**(2/3), [], []]
             ]
         else:
             # Decimate from k to ceil(k/2)+1
@@ -559,18 +559,18 @@ def schrieffer_wolff_legacy(hamiltonian_file, max_locality):
             delta = coef/epsilon**2
             new_terms = [
                 # Projector term
-                (delta, ('|1><1|',), (ancilla_qubit,)),
+                [delta, ['|1><1|'], [ancilla_qubit]],
                 # V; term associated to -A
-                (-sign*sqrt(delta*coef/2),
-                    (*low_hamiltonian[0], 'x'), (*low_hamiltonian[1], ancilla_qubit)),
+                [-sign*sqrt(delta*coef/2),
+                    [*low_hamiltonian[0], 'x'], [*low_hamiltonian[1], ancilla_qubit]],
                 # V; term associated to B
-                (sqrt(delta*coef/2),
-                    (*high_hamiltonian[0], 'x'), (*high_hamiltonian[1], ancilla_qubit)),
+                [sqrt(delta*coef/2),
+                    [*high_hamiltonian[0], 'x'], [*high_hamiltonian[1], ancilla_qubit]],
                 # V_extra; A² and B² are Pauli operators!
                 # (Although projectors are introduced into the hamiltonian, they
                 #  are never coupled to other bodies; the ancilla qubit is coupled
                 #  to the existing bodies via an X Pauli operator)
-                (coef, (), ())
+                [coef, [], []]
             ]
 
         # Transform each new term into a decimated one; decimation will occur
@@ -578,7 +578,7 @@ def schrieffer_wolff_legacy(hamiltonian_file, max_locality):
         result = []
         for term in new_terms:
             result.extend(decimate(*term))
-        return tuple(result)
+        return result
 
     # Read the hamiltonian file;
     # Get from the file:
@@ -669,7 +669,7 @@ def ground_state_from_terms(hamiltonian, num_systems, analytical=False, circuit=
     if analytical:
         # return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
         #                                        k=1, which='SA', return_eigenvectors=False))
-        return np.min(np.linalg.eigvalsh(matrix_from_terms(hamiltonian, num_systems).todense()))
+        return np.min(np.linalg.eigvalsh(matrix_from_terms(hamiltonian, num_systems).toarray()))
     else:
         # Simulate a variational eigensolver
         matrix = matrix_from_terms(hamiltonian, num_systems)
@@ -680,7 +680,7 @@ def ground_state_from_terms(hamiltonian, num_systems, analytical=False, circuit=
             out = np.array(circuit.run([1] + [0] * (2**num_systems - 1)))
             return (np.conjugate(out.T) @ matrix @ out).real
         optres = scipy.optimize.minimize(
-            eval, [gate.get_parameters() for gate in gates])
+            eval, [gate.get_parameters() for gate in gates], method='L-BFGS-B')
         return optres.fun
 
 
@@ -928,7 +928,10 @@ if __name__ == '__main__':
             debugio.write("# length exact decomposed\n")
             for file in tqdm(glob(f"{output_directory}/*.hamiltonian")):
                 print(file)
-                decomposed, system_num = schrieffer_wolff_legacy(file, qubits)
+                if '--legacy' in arguments:
+                    decomposed, system_num = schrieffer_wolff_legacy(file, qubits)
+                else:
+                    decomposed, system_num = schrieffer_wolff(file, qubits, klargest)
                 approx = ground_state_from_terms(
                     decomposed,
                     system_num,
@@ -964,7 +967,10 @@ if __name__ == '__main__':
     if not skip:
         print("Calculating Schrieffer-Wolff decomposition...", flush=True)
         for hamiltonian_file in tqdm(glob(f"{output_directory}/*.hamiltonian")):
-            sw, system_num = schrieffer_wolff_legacy(hamiltonian_file, qubits)
+            if '--legacy' in arguments:
+                sw, system_num = schrieffer_wolff_legacy(hamiltonian_file, qubits)
+            else:
+                sw, system_num = schrieffer_wolff(hamiltonian_file, qubits, klargest)
             sw.sort(key=lambda x: x[2])
 
             with open(f"{hamiltonian_file}.sw", 'w') as outfile:
