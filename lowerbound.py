@@ -76,8 +76,6 @@ from tqdm import tqdm
 import cextension
 import qop
 
-STRETCH = 1
-
 # Define parsing a line of a hamiltonian file
 
 
@@ -632,7 +630,7 @@ def matrix_from_terms(hamiltonian, num_systems):
                 else:
                     raise Exception(f"Unknown operator {operator}")
                 operator_matrix = scipy.sparse.kron(
-                    operator_matrix, scipy.sparse.coo_matrix(operator))
+                    operator_matrix, scipy.sparse.csr_matrix(operator))
                 actual_op_index += 1
             else:
                 operator_matrix = scipy.sparse.kron(
@@ -646,30 +644,49 @@ def matrix_from_terms(hamiltonian, num_systems):
 
 def ansatz(nqubits, nlayers):
     c = qop.Circuit(nqubits)
-    ry_gates = []
+    circ_gates = []
     for _ in range(nlayers):
         for i in range(2):
             for qubit in range(nqubits):
+                rx = qop.Gate('rx', parameters=[
+                    (random.random() - 0.5) * 2 * 3.1415926])
                 ry = qop.Gate('ry', parameters=[
                     (random.random() - 0.5) * 2 * 3.1415926])
+                rz = qop.Gate('rz', parameters=[
+                    (random.random() - 0.5) * 2 * 3.1415926])
+                c.add_gate(rx, qubit)
                 c.add_gate(ry, qubit)
-                ry_gates.append(ry)
+                c.add_gate(rz, qubit)
+                circ_gates.extend([rx, ry, rz])
             for qubit in range(0, nqubits, 2):
                 z = qop.Gate('z')
                 c.add_gate(z, (qubit + i) % nqubits, (qubit + i + 1) % nqubits)
     for qubit in range(nqubits):
+        rx = qop.Gate('rx', parameters=[
+            (random.random() - 0.5) * 2 * 3.1415926])
         ry = qop.Gate('ry', parameters=[
-                      (random.random() - 0.5) * 2 * 3.1415926])
-        ry_gates.append(ry)
+            (random.random() - 0.5) * 2 * 3.1415926])
+        rz = qop.Gate('rz', parameters=[
+            (random.random() - 0.5) * 2 * 3.1415926])
+        c.add_gate(rx, qubit)
         c.add_gate(ry, qubit)
-    return c, ry_gates
+        c.add_gate(rz, qubit)
+        circ_gates.extend([rx, ry, rz])
+    return c, circ_gates
 
 
 def ground_state_from_terms(hamiltonian, num_systems, analytical=False, circuit=None, gates=None):
     if analytical:
         # return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
         #                                        k=1, which='SA', return_eigenvectors=False))
-        return np.min(np.linalg.eigvalsh(matrix_from_terms(hamiltonian, num_systems).toarray()))
+        try:
+            return np.min(np.linalg.eigvalsh(matrix_from_terms(hamiltonian, num_systems).toarray()))
+        except MemoryError:
+            return scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
+            k=1, which='SA')[0]
+        except MemoryError as memerror:
+            print(f"For a {num_systems} qubit hamiltonian:")
+            raise memerror
     else:
         # Simulate a variational eigensolver
         matrix = matrix_from_terms(hamiltonian, num_systems)
@@ -798,7 +815,7 @@ if __name__ == '__main__':
     layers = molecule_json['circuit']['layers']
 
     # Prepare a quantum circuit for variational eigensolving
-    circuit, circuit_rys = ansatz(qubits, layers)
+    circuit, circuit_gates = ansatz(qubits, layers)
 
     def get_filename(molecule_name, basis, *rest):
         return f"{output_directory}/{molecule_name}_{basis}_{rest}.molecule"
@@ -877,8 +894,6 @@ if __name__ == '__main__':
                 qubit_hamiltonian = jordan_wigner(fermion_hamiltonian)
                 qubit_hamiltonian.compress()
 
-                qubit_hamiltonian *= STRETCH
-
                 # Find out what the largest coupling is,
                 # And the number of qubits involved
                 largest_coupling = 0.
@@ -903,19 +918,19 @@ if __name__ == '__main__':
                     outfile.write(f"#!Ancilla Qubits Start At {max_q_index}\n")
                     if run_scf:
                         outfile.write(
-                            f"#!HF-energy {molecule.hf_energy * STRETCH}\n")
+                            f"#!HF-energy {molecule.hf_energy}\n")
                     if run_ccsd:
                         outfile.write(
-                            f"#!CCSD-energy {molecule.ccsd_energy * STRETCH}\n")
+                            f"#!CCSD-energy {molecule.ccsd_energy}\n")
                     if run_cisd:
                         outfile.write(
-                            f"#!CISD-energy {molecule.cisd_energy * STRETCH}\n")
+                            f"#!CISD-energy {molecule.cisd_energy}\n")
                     if run_mp2:
                         outfile.write(
-                            f"#!MP2-energy {molecule.mp2_energy * STRETCH}\n")
+                            f"#!MP2-energy {molecule.mp2_energy}\n")
                     if run_fci:
                         outfile.write(
-                            f"#!FCI-energy {molecule.fci_energy * STRETCH}\n")
+                            f"#!FCI-energy {molecule.fci_energy}\n")
                     outfile.write("# Jordan-Wigner hamiltonian follows\n")
                     outfile.write(f"{qubit_hamiltonian}")
                 print(f"Finished writing {molecule.filename + '.hamiltonian'}")
@@ -1152,7 +1167,7 @@ if __name__ == '__main__':
                         len(partition),
                         '--no-variational' in arguments,
                         circuit,
-                        circuit_rys)
+                        circuit_gates)
 
                 lower_bound = sum(map(mp_lowerbound, zip(partitions, split)))
                 # lower_bound = sum(
