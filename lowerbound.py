@@ -55,7 +55,7 @@ from bisect import bisect_left
 from collections import defaultdict
 from functools import reduce
 from glob import glob
-from itertools import chain
+from itertools import chain, islice, count
 
 import h5py
 import numpy as np
@@ -64,7 +64,7 @@ import qop
 import scipy
 import scipy.optimize
 from more_itertools import partition
-from numpy import abs, ceil, sqrt
+from numpy import abs, ceil, sqrt, pi
 from openfermion.hamiltonians import MolecularData
 from openfermion.ops import QubitOperator
 from openfermion.transforms import (get_fermion_operator, get_sparse_operator,
@@ -75,6 +75,13 @@ from tqdm import tqdm
 
 import cextension
 import qop
+
+
+def pairwise(iterable):
+    "s -> (s0,s1), (s1,s2), (s2, s3), ..."
+    a, b = tee(iterable)
+    next(b, None)
+    return zip(a, b)
 
 # Define parsing a line of a hamiltonian file
 
@@ -275,7 +282,8 @@ def schrieffer_wolff(hamiltonian_file, max_locality, k_largest=1):
         # representing a hamiltonian that is the sum of all
         # these items.
 
-        terms = list(filter(lambda term: np.linalg.norm(term[0]) > CUTOFF, terms))
+        terms = list(
+            filter(lambda term: np.linalg.norm(term[0]) > CUTOFF, terms))
 
         if locality <= max_locality:
             return terms
@@ -642,6 +650,149 @@ def matrix_from_terms(hamiltonian, num_systems):
     return total_hamiltonian
 
 
+def reparameterize_a_gate(theta, phi, a_gate):
+    rz_dag, ry_dag, ry, rz = a_gate
+    rz_dag.reparameterize((-phi-pi,))
+    ry_dag.reparameterize((-theta-pi/2,))
+    ry.reparameterize((theta+pi/2,))
+    rz.reparameterize((phi+pi,))
+
+
+def ansatz(nqubits, nlayers, nelectrons):
+    if nqubits < nelectrons:
+        raise Exception("Cannot have a number of qubits smaller than the number " +
+                        "of bodies!")
+    c = qop.Circuit(nqubits)
+    a_gates = []
+    if nqubits == nelectrons:  # There's only the |1111...> state to evaluate...
+        for qubit in range(nqubits):
+            x = qop.Gate('x')
+            c.add_gate(x, qubit)
+    else:  # We can evaluate excitations
+        # Each A gate is decomposable in
+        #
+        # --┌   ┐--   --X------------o------------X--
+        #   | A |   =   |            |            |
+        # --└   ┘--   --o--[1]--[2]--X--[3]--[4]--o--
+        #
+        # 1. Rz(-phi-pi)
+        # 2. Ry(-theta-pi/2)
+        # 3. Ry(theta+pi/2)
+        # 4. Rz(phi+pi)
+        #
+        # And a layer is composed of (e.g. 4 qubits)
+        #
+        # --┌          ┐----------------
+        #   | A(t1,p1) |
+        # --└          ┘--┌          ┐--
+        #                 | A(t3,p3) |
+        # --┌          ┐--└          ┘--
+        #   | A(t2,p2) |
+        # --└          ┘----------------
+        #
+        # Each A gate is given as a tuple (1., 2., 3., 4.)
+
+        def add_a_gate(i):
+            a_1 = qop.Gate('x')
+            c.add_gate(a_1, qubit=i, control=i+1)
+            a_2 = qop.Gate('rz', parameters=[
+                (random.random() - 0.5) * 2 * 3.1415926])
+            c.add_gate(a_2, qubit=i+1)
+            a_3 = qop.Gate('ry', parameters=[
+                (random.random() - 0.5) * 2 * 3.1415926])
+            c.add_gate(a_3, qubit=i+1)
+            a_4 = qop.Gate('x')
+            c.add_gate(a_4, qubit=i+1, control=i)
+            a_5 = qop.Gate('ry', parameters=[
+                (random.random() - 0.5) * 2 * 3.1415926])
+            c.add_gate(a_5, qubit=i+1)
+            a_6 = qop.Gate('rz', parameters=[
+                (random.random() - 0.5) * 2 * 3.1415926])
+            c.add_gate(a_6, qubit=i+1)
+            a_7 = qop.Gate('x')
+            c.add_gate(a_7, qubit=i, control=i+1)
+            return (a_2, a_3, a_5, a_6)
+
+        # Start by creating the excitations
+        """ Every-other-wire approach
+        # Cycle odd wires first, then even wires as needed
+        for x_index in islice(chain(range(0, nqubits, 2), range(1, nqubits, 2)), nelectrons):
+            x = qop.Gate('x')
+            c.add_gate(x, x_index)
+
+        # Look for X(tensor)I operation pairs
+        start_index = max(0, 2*(nelectrons - ceil(nqubits/2)))
+        if nelectrons < ceil(nqubits/2):
+            end_index = 2*nelectrons
+        else:
+            if nqubits % 2 == 0:
+                end_index = nqubits
+            else:
+                if nelectrons == ceil(nqubits/2):
+                    end_index = nqubits - 1
+                else:
+                    end_index = nqubits
+
+        for _layer in range(layers):
+            for i in range(start_index, end_index, 2):
+                a_gate = add_a_gate(i)
+                a_gates.append(a_gate)
+            for i in range(start_index + 1, end_index, 2):
+                a_gate = add_a_gate(i)
+                a_gates.append(a_gate)
+        """
+        # Distribute the excitation gates evenly
+        with_x_gates = []
+        for x_index in islice(count(0, int(nqubits/nelectrons)), nelectrons):
+            x_index %= nqubits
+            if x_index in with_x_gates:
+                raise Exception("Something went wrong with the algorithm! " +
+                                "Two X gates should not be placed in the same wire.")
+            with_x_gates.append(x_index)
+            x = qop.Gate('x')
+            c.add_gate(x)
+
+        # Take the straightforward approach: look at the indexes
+        # with x gates on them and see if there's a space afterwards
+        with_a_gates = []
+        for x_index in with_x_gates:
+            if x_index != nqubits - 1 and x_index + 1 not in with_x_gates:
+                with_a_gates.append(x_index)
+
+        # Identify indexes connecting empty spaces and gates
+        exhausted = False
+        last_sublayer = with_a_gates
+        while not exhausted:
+            exhausted = True
+            last_sublayer_new = []
+            for a_gate_index in last_sublayer:
+                if a_gate_index > 0 and \
+                        a_gate_index - 1 not in with_x_gates and \
+                        a_gate_index - 1 not in with_a_gates:
+                    with_a_gates.append(a_gate_index - 1)
+                    last_sublayer_new.append(a_gate_index - 1)
+                    exhausted = False
+
+            for a_gate_index in last_sublayer:
+                if a_gate_index < nqubits - 2 and \
+                        a_gate_index + 2 not in with_x_gates and \
+                        a_gate_index + 1 not in with_a_gates:
+                    with_a_gates.append(a_gate_index + 1)
+                    last_sublayer_new.append(a_gate_index + 1)
+                    exhausted = False
+
+            last_sublayer = last_sublayer_new
+
+        # Build layers
+        for _layer in range(layers):
+            for a_index in with_a_gates:
+                a_gate = add_a_gate(a_index)
+                a_gates.append(a_gate)
+
+    return c, a_gates
+
+
+"""
 def ansatz(nqubits, nlayers):
     c = qop.Circuit(nqubits)
     circ_gates = []
@@ -673,6 +824,7 @@ def ansatz(nqubits, nlayers):
         c.add_gate(rz, qubit)
         circ_gates.extend([rx, ry, rz])
     return c, circ_gates
+"""
 
 
 def ground_state_from_terms(hamiltonian, num_systems, analytical=False, circuit=None, gates=None):
@@ -683,21 +835,26 @@ def ground_state_from_terms(hamiltonian, num_systems, analytical=False, circuit=
             return np.min(np.linalg.eigvalsh(matrix_from_terms(hamiltonian, num_systems).toarray()))
         except MemoryError:
             return scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
-            k=1, which='SA')[0]
+                                             k=1, which='SA')[0]
         except MemoryError as memerror:
             print(f"For a {num_systems} qubit hamiltonian:")
             raise memerror
     else:
         # Simulate a variational eigensolver
         matrix = matrix_from_terms(hamiltonian, num_systems)
+        # A gates are correlated (refer to the ansatz() function)
+        # Parameters has two values (theta, phi) for each A gate
+        parameters = [chain.from_iterable(
+            (random.random()*pi, random.random()*pi) for _ in gates)]
 
         def eval(theta):
-            for param, gate in zip(theta, gates):
-                gate.reparameterize((param,))
+            for a_gate, theta_phi in zip(gates, pairwise(theta)):
+                theta, phi = theta_phi
+                reparameterize_a_gate(theta, phi, a_gate)
             out = np.array(circuit.run([1] + [0] * (2**num_systems - 1)))
             return (np.conjugate(out.T) @ matrix @ out).real
         optres = scipy.optimize.minimize(
-            eval, [gate.get_parameters() for gate in gates], method='L-BFGS-B')
+            eval, parameters, method='L-BFGS-B')
         return optres.fun
 
 
@@ -748,6 +905,7 @@ if __name__ == '__main__':
         },
         "epsilon": ,
         "klargest": 1,
+        "electrons": ,
         "sfc": ,
         "mp2": ,
         "cisd": ,
@@ -802,6 +960,7 @@ if __name__ == '__main__':
         'stop', None)
     epsilon = molecule_json['simulation']['epsilon']
     klargest = molecule_json['simulation'].get('klargest', 1)
+    electrons = molecule_json['simulation']['electrons']
 
     # Set calculation parameters.
     run_scf = molecule_json['simulation']['sfc']
@@ -815,7 +974,7 @@ if __name__ == '__main__':
     layers = molecule_json['circuit']['layers']
 
     # Prepare a quantum circuit for variational eigensolving
-    circuit, circuit_gates = ansatz(qubits, layers)
+    circuit, circuit_gates = ansatz(qubits, layers, electrons)
 
     def get_filename(molecule_name, basis, *rest):
         return f"{output_directory}/{molecule_name}_{basis}_{rest}.molecule"
@@ -944,9 +1103,11 @@ if __name__ == '__main__':
             for file in tqdm(glob(f"{output_directory}/*.hamiltonian")):
                 print(file)
                 if '--legacy' in arguments:
-                    decomposed, system_num = schrieffer_wolff_legacy(file, qubits)
+                    decomposed, system_num = schrieffer_wolff_legacy(
+                        file, qubits)
                 else:
-                    decomposed, system_num = schrieffer_wolff(file, qubits, klargest)
+                    decomposed, system_num = schrieffer_wolff(
+                        file, qubits, klargest)
                 approx = ground_state_from_terms(
                     decomposed,
                     system_num,
@@ -983,9 +1144,11 @@ if __name__ == '__main__':
         print("Calculating Schrieffer-Wolff decomposition...", flush=True)
         for hamiltonian_file in tqdm(glob(f"{output_directory}/*.hamiltonian")):
             if '--legacy' in arguments:
-                sw, system_num = schrieffer_wolff_legacy(hamiltonian_file, qubits)
+                sw, system_num = schrieffer_wolff_legacy(
+                    hamiltonian_file, qubits)
             else:
-                sw, system_num = schrieffer_wolff(hamiltonian_file, qubits, klargest)
+                sw, system_num = schrieffer_wolff(
+                    hamiltonian_file, qubits, klargest)
             sw.sort(key=lambda x: x[2])
 
             with open(f"{hamiltonian_file}.sw", 'w') as outfile:
@@ -1040,7 +1203,7 @@ if __name__ == '__main__':
                         break
 
                 sw = [[complex(x), y, z]
-                    for x, y, z in json.loads(sw_file.read())]
+                      for x, y, z in json.loads(sw_file.read())]
 
             # Split terms into partitions; if a term fits in more than one partition,
             # distribute it equally
@@ -1153,7 +1316,8 @@ if __name__ == '__main__':
                 with open(partitioned) as partitioned:
                     partitioned = json.load(partitioned)
 
-                    hamiltonian = [[complex(x), y, z] for x,y,z in partitioned['hamiltonian']]
+                    hamiltonian = [[complex(x), y, z]
+                                   for x, y, z in partitioned['hamiltonian']]
                     partitions = partitioned['partitions']
                     split = partitioned['split']
 
@@ -1196,10 +1360,11 @@ if __name__ == '__main__':
                         terms, len(partition))
                     lower_bound += local_ground_state
                 """
-                
+
                 intermediate["lower_bounds"][i] = lower_bound
                 if abs(lower_bound_nopart.imag) > 1e-10:
-                    raise Exception("Lower bounds (no partition) is significantly complex!")
+                    raise Exception(
+                        "Lower bounds (no partition) is significantly complex!")
                 intermediate["lower_bounds_nopart"][i] = lower_bound_nopart.real
 
             with open(f"{molecule_name}.txt", 'w') as output:
