@@ -12,6 +12,8 @@ Usage:
               [-sp | --skip-partitioning]
               [-slb | --skip-lower-bound]
               [--debug-decomposition]
+              [--legacy | --direct-decomposition]
+              [--no-variational]
   molecule.py --template <file>
 
 Options:
@@ -39,6 +41,12 @@ Options:
                                 this will likely crash the computer in
                                 trying to diagonalize the exact
                                 hamiltonian!
+      --legacy
+      --direct-decomposition    Use a direct decomposition scheme,
+                                instead of using a Singular Value
+                                Decomposition based decomposition scheme.
+                                This causes the parameter 'klargest' to
+                                be ignored.
       --no-variational          Determine the ground state energy using
                                 numpy/scipy's eigenvalue functions,
                                 rather than simulating a variational
@@ -51,6 +59,7 @@ import json_tricks as json
 import os
 import random
 import re
+import gc
 from bisect import bisect_left
 from collections import defaultdict
 from functools import reduce
@@ -75,6 +84,10 @@ from tqdm import tqdm
 
 import cextension
 import qop
+
+CORES = 8 
+epsilon = 0.1
+CUTOFF = 1e-6
 
 # Define parsing a line of a hamiltonian file
 
@@ -111,9 +124,6 @@ def parse_hamiltonian_line(line):
 
 # Produce a k-local hamiltonian via Schrieffer-Wolff transforms
 
-
-epsilon = 0.1
-CUTOFF = 1e-6
 
 
 def prod_sigmas(a, b):
@@ -350,7 +360,7 @@ def schrieffer_wolff(hamiltonian_file, max_locality, k_largest=1):
 
             # The operator can be written as Sum(Tensor(u[i], s[i]*vt[i].T) for i)
             key_sorted = np.argsort(-np.abs(s))
-            for sv_index in key_sorted[:k_largest] if klargest > 0 else key_sorted:
+            for sv_index in (key_sorted[:k_largest] if klargest > 0 else key_sorted):
                 if abs(s[sv_index]) < 10e-10:  # Approximately 0
                     continue
 
@@ -694,10 +704,14 @@ def ground_state_from_terms(hamiltonian, num_systems, analytical=False, circuit=
         def eval(theta):
             for param, gate in zip(theta, gates):
                 gate.reparameterize((param,))
-            out = np.array(circuit.run([1] + [0] * (2**num_systems - 1)))
-            return (np.conjugate(out.T) @ matrix @ out).real
+            out = np.array(
+                circuit.run([1] + [0] * (2**num_systems - 1)))
+            val = (np.conjugate(out.T) @ matrix @ out).real
+            return val
+            
         optres = scipy.optimize.minimize(
             eval, [gate.get_parameters() for gate in gates], method='L-BFGS-B')
+        gc.collect()
         return optres.fun
 
 
@@ -943,7 +957,7 @@ if __name__ == '__main__':
             debugio.write("# length exact decomposed\n")
             for file in tqdm(glob(f"{output_directory}/*.hamiltonian")):
                 print(file)
-                if '--legacy' in arguments:
+                if '--legacy' in arguments or '--direct-decomposition' in arguments:
                     decomposed, system_num = schrieffer_wolff_legacy(file, qubits)
                 else:
                     decomposed, system_num = schrieffer_wolff(file, qubits, klargest)
@@ -982,7 +996,7 @@ if __name__ == '__main__':
     if not skip:
         print("Calculating Schrieffer-Wolff decomposition...", flush=True)
         for hamiltonian_file in tqdm(glob(f"{output_directory}/*.hamiltonian")):
-            if '--legacy' in arguments:
+            if '--legacy' in arguments or '--direct-decomposition' in arguments:
                 sw, system_num = schrieffer_wolff_legacy(hamiltonian_file, qubits)
             else:
                 sw, system_num = schrieffer_wolff(hamiltonian_file, qubits, klargest)
@@ -1147,7 +1161,7 @@ if __name__ == '__main__':
             # Do this in bond length order
             bl_ordered = sorted(glob(f"{output_directory}/*.partitioned"),
                                 key=lambda fn: float(filename_pat.search(fn).group(1)))
-            for i, partitioned in tqdm(enumerate(bl_ordered)):
+            for i, partitioned in tqdm(enumerate(bl_ordered), total=len(bl_ordered)):
                 intermediate["filename_index"][i] = partitioned
 
                 with open(partitioned) as partitioned:
@@ -1156,8 +1170,6 @@ if __name__ == '__main__':
                     hamiltonian = [[complex(x), y, z] for x,y,z in partitioned['hamiltonian']]
                     partitions = partitioned['partitions']
                     split = partitioned['split']
-
-                #pool = mp.Pool(2)
 
                 def mp_lowerbound(args):
                     partition, terms = args
@@ -1169,10 +1181,6 @@ if __name__ == '__main__':
                         circuit,
                         circuit_gates)
 
-                lower_bound = sum(map(mp_lowerbound, zip(partitions, split)))
-                # lower_bound = sum(
-                #    pool.map(mp_lowerbound, zip(partitions, split)))
-
                 def mp_lowerbound_nopart(term):
                     if len(term[2]) == 0:
                         return term[0]
@@ -1182,10 +1190,20 @@ if __name__ == '__main__':
                         [keyed_term], len(term[2])).todense()
                     return np.min(np.linalg.eigvalsh(matrix))
 
-                lower_bound_nopart = sum(
-                    map(mp_lowerbound_nopart, hamiltonian))
-                # lower_bound_nopart = sum(
-                #    pool.map(mp_lowerbound_nopart, hamiltonian))
+                if CORES > 1:
+                    with mp.Pool(CORES) as pool:
+                        #lower_bound = sum(map(mp_lowerbound, zip(partitions, split)))
+                        lower_bound = sum(
+                            pool.map(mp_lowerbound, zip(partitions, split)))
+
+                        #lower_bound_nopart = sum(
+                        #    map(mp_lowerbound_nopart, hamiltonian))
+                        lower_bound_nopart = sum(
+                            pool.map(mp_lowerbound_nopart, hamiltonian))
+                else:
+                    lower_bound = sum(map(mp_lowerbound, zip(partitions, split)))
+                    lower_bound_nopart = sum(
+                        map(mp_lowerbound_nopart, hamiltonian))
 
                 """
                 for partition, terms in zip(partitions, split):
