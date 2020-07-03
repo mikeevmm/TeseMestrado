@@ -1,10 +1,10 @@
 #include "include/module.h"
 
-#define EARLY_EXIT              \
-  {                             \
-    printf("Exiting early!\n"); \
-    Py_INCREF(Py_None);         \
-    return Py_None;             \
+#define EARLY_EXIT                                                             \
+  {                                                                            \
+    printf("Exiting early!\n");                                                \
+    Py_INCREF(Py_None);                                                        \
+    return Py_None;                                                            \
   }
 
 static void reprint(PyObject *obj) {
@@ -25,6 +25,7 @@ int sort_ham_term_by_syslen(const void *a_addr, const void *b_addr) {
   // Each hamiltonian term is of the form (coef, [operators], [systems])
   // We are interested in oredering the terms from greatest number of
   // systems to least number
+  // PyList_GetItem returns a borrowed reference
   Py_ssize_t a_len = PyList_GET_SIZE(PyList_GetItem(a, 2));
   Py_ssize_t b_len = PyList_GET_SIZE(PyList_GetItem(b, 2));
 
@@ -47,7 +48,8 @@ PyMODINIT_FUNC PyInit_cextension() {
   PyObject *mod;
 
   mod = PyModule_Create(&module);
-  if (mod == NULL) return NULL;
+  if (mod == NULL)
+    return NULL;
 
   import_array();
   if (PyErr_Occurred()) {
@@ -95,7 +97,8 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
     // at some point
     hamiltonian_iter =
         PySequence_Fast(hamiltonian_object, "argument must be iterable");
-    if (!hamiltonian_iter) return NULL;
+    if (!hamiltonian_iter)
+      return NULL;
 
     term_count = PySequence_Fast_GET_SIZE(hamiltonian_iter);
     hamiltonian = malloc(term_count * sizeof(PyObject *));
@@ -139,7 +142,6 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
 
   {
     // Prepare to run over all `locality` sized subsets of `0..system_num`
-    int x = 0, y = 0, z = 0;
 
     unsigned int subset[locality];
     for (unsigned int i = 0; i < locality; ++i) {
@@ -152,6 +154,7 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
     int p[system_num + 2];
     inittwiddle(locality, system_num, p);
 
+    int x = 0, y = 0, z = 0;
     unsigned int partition_index = 1;
     while (!twiddle(&x, &y, &z, p)) {
       subset[z] = (unsigned int)x;
@@ -169,7 +172,7 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
     }
 
     assert(partition_index == partition_count);
-  }  // Finished calculating all possible partitions
+  } // Finished calculating all possible partitions
 
   // Define partition score
   unsigned int best_score = 0;
@@ -223,182 +226,210 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
 
   // Now that the terms are sorted from most # of involved systems to least,
   // attribute score to the top scoring partitions that fit the terms
-  for (unsigned int term_index = 0; term_index < term_count; ++term_index) {
-    PyObject *term = hamiltonian[term_index];
-
-    // Extract info from term
-    double coef;
-    PyObject *operators;
-    PyObject *systems;
-    {
-      coef = PyFloat_AS_DOUBLE(PyList_GetItem(term, 0));
-      operators = PyList_GetItem(term, 1);
-      systems = PyList_GetItem(term, 2);
-    }
-
-    // Used to iterate over the systems in `sytems`;
-    // `PySequence_Fast` returns a new reference
-    PyObject *systems_fastseq =
-        PySequence_Fast(systems, "systems must be iterable");
-    if (!systems_fastseq) {
-      // Could not instantiate iterable over `systems`
-      for (unsigned int i = 0; i < partition_count; ++i) {
-        Vector *split_term = split_terms + i;
-        vector_free(split_term);
-      }
-      free(split_terms);
-      free(hamiltonian);
-      free(partitions);
-      free(partition_score);
-      return NULL;
-    }
-
-    Py_ssize_t systems_len = PySequence_Fast_GET_SIZE(systems_fastseq);
-
-    //printf("SYSTEMS: [");
-    //for (int i = 0; i < systems_len; ++i)
-    //  printf("%li, ", PyNumber_AsSsize_t(
-    //                      PySequence_Fast_GET_ITEM(systems_fastseq, i), NULL));
-    //printf("]\n");
-
-    // Go through the partitions in descending score
-    qsort(partition_score, partition_count, sizeof(PartitionScore),
-          sort_partition_by_score);
-
+  {
     // Partitions of top score in which the term fits
+    // (This vector is declared here because it is reused for every iteration)
     Vector best;
     vector_init(&best, sizeof(unsigned int), 0);
 
-    Option_Uint fitting_score = option_none_uint();
-    for (unsigned int partscore_index = 0; partscore_index < partition_count;
-         ++partscore_index) {
-      unsigned int partition_index =
-          partition_score[partscore_index].partition_index;
-      unsigned int score = partition_score[partscore_index].score;
-      unsigned int *partition = partitions + partition_index * locality;
+    for (unsigned int term_index = 0; term_index < term_count; ++term_index) {
+      PyObject *term = hamiltonian[term_index];
 
-      // Skip this partition if it can't contain the term.
-      // Because the indices in partition are sorted, we
-      // perform a binary search of partition for each system
-      bool skip_partition = false;
+      // Extract info from term
+      double coef;
+      PyObject *operators;
+      PyObject *systems;
       {
-        // Check each system in `systems`
-        for (unsigned int sys_index = 0; sys_index < systems_len; ++sys_index) {
-          unsigned int system = (unsigned int)PyNumber_AsSsize_t(
-              PySequence_Fast_GET_ITEM(systems_fastseq, sys_index), NULL);
+        coef = PyFloat_AS_DOUBLE(PyList_GetItem(term, 0));
+        operators = PyList_GetItem(term, 1);
+        systems = PyList_GetItem(term, 2);
+      }
 
-          // We can skip the binary search immediately if the system is out of
-          // bounds to the partition
-          if (system < partition[0] || system > partition[locality - 1]) {
-            skip_partition = true;
-            break;  // From checking other systems
+      // Used to iterate over the systems in `sytems`;
+      // `PySequence_Fast` returns a new reference
+      PyObject *systems_fastseq =
+          PySequence_Fast(systems, "systems must be iterable");
+      if (!systems_fastseq) {
+        // Could not instantiate iterable over `systems`
+        for (unsigned int i = 0; i < partition_count; ++i) {
+          Vector *split_term = split_terms + i;
+          vector_free(split_term);
+        }
+        free(split_terms);
+        free(hamiltonian);
+        free(partitions);
+        free(partition_score);
+        return NULL;
+      }
+
+      Py_ssize_t systems_len = PySequence_Fast_GET_SIZE(systems_fastseq);
+
+      // printf("SYSTEMS: [");
+      // for (int i = 0; i < systems_len; ++i)
+      //  printf("%li, ", PyNumber_AsSsize_t(
+      //                      PySequence_Fast_GET_ITEM(systems_fastseq, i),
+      //                      NULL));
+      // printf("]\n");
+
+      // Go through the partitions in descending score
+      qsort(partition_score, partition_count, sizeof(PartitionScore),
+            sort_partition_by_score);
+
+      // Clear `best`, for reuse
+      // (Recall it's usec for the partitions of top score in which the term
+      // fits)
+      {
+        Result clean_r = vector_clean(&best);
+        if (!clean_r.valid) {
+          PyErr_SetString("Qop internal error: Failed to clean `best` vector.");
+          for (unsigned int i = 0; i < partition_count; ++i) {
+            Vector *split_term = split_terms + i;
+            vector_free(split_term);
           }
-
-          // Perform actual binary search in the partition for the system
-          {
-            unsigned int low = 0;
-            unsigned int high = locality;
-
-            while (true) {
-              if (low > high) {
-                // Unsuccessful, partition does not contain `system`
-                skip_partition = true;
-                break;  // From binary search loop
-              }
-
-              unsigned int middle = (low + high) / 2;
-              unsigned int middle_elem = partition[middle];
-
-              if (middle_elem < system) {
-                low = middle + 1;
-                continue;  // To next binary search loop
-              }
-
-              if (middle_elem > system) {
-                high = middle - 1;
-                continue;  // To next binary search loop
-              }
-
-              if (middle_elem == system) {
-                // The partition contains the system; seach for next system
-                break;  // From searching this system
-              }
-            }  // End of binary search loop
-
-            if (skip_partition) break;  // From searching others systems
-          }                             // Done performing binary search
-        }  // Searched the partition for all systems
-
-      }  // Finished assessing whether to skip this partition
-
-      if (skip_partition) {
-        //printf("\tSKIPPING [");
-        //for (int i = 0; i < locality; ++i) printf("%u, ", partition[i]);
-        //printf("]\n");
-        continue;  // To next partition
+          free(split_terms);
+          free(hamiltonian);
+          free(partitions);
+          free(partition_score);
+          return NULL;
+        }
       }
 
-      //printf("\tVALID [");
-      //for (int i = 0; i < locality; ++i) printf("%u, ", partition[i]);
-      //printf("]\n");
+      Option_Uint fitting_score = option_none_uint();
+      for (unsigned int partscore_index = 0; partscore_index < partition_count;
+           ++partscore_index) {
+        unsigned int partition_index =
+            partition_score[partscore_index].partition_index;
+        unsigned int score = partition_score[partscore_index].score;
+        unsigned int *partition = partitions + partition_index * locality;
 
-      // This partition is valid;
-      // If it's the first valid partition we see, continue onto adding
-      // it to the `split_terms`, otherwise, only add it if the score
-      // matches last seen fitting partition.
-      // Because partitions are in descending score order, if this partition
-      // has a lower score than previously seen, immediately stop iterating
-      // over the partitions
-      if (!fitting_score.some) {
-        fitting_score = option_from_uint(score);
-      } else if (score < fitting_score.data) {
-        break;
+        // Skip this partition if it can't contain the term.
+        // Because the indices in partition are sorted, we
+        // perform a binary search of partition for each system
+        bool skip_partition = false;
+        {
+          // Check each system in `systems`
+          for (unsigned int sys_index = 0; sys_index < systems_len;
+               ++sys_index) {
+            unsigned int system = (unsigned int)PyNumber_AsSsize_t(
+                PySequence_Fast_GET_ITEM(systems_fastseq, sys_index), NULL);
+
+            // We can skip the binary search immediately if the system is out of
+            // bounds to the partition
+            if (system < partition[0] || system > partition[locality - 1]) {
+              skip_partition = true;
+              break; // From checking other systems
+            }
+
+            // Perform actual binary search in the partition for the system
+            {
+              unsigned int low = 0;
+              unsigned int high = locality;
+
+              while (true) {
+                if (low > high) {
+                  // Unsuccessful, partition does not contain `system`
+                  skip_partition = true;
+                  break; // From binary search loop
+                }
+
+                unsigned int middle = (low + high) / 2;
+                unsigned int middle_elem = partition[middle];
+
+                if (middle_elem < system) {
+                  low = middle + 1;
+                  continue; // To next binary search loop
+                }
+
+                if (middle_elem > system) {
+                  high = middle - 1;
+                  continue; // To next binary search loop
+                }
+
+                if (middle_elem == system) {
+                  // The partition contains the system; seach for next system
+                  break; // From searching this system
+                }
+              } // End of binary search loop
+
+              if (skip_partition)
+                break; // From searching others systems
+            }          // Done performing binary search
+          }            // Searched the partition for all systems
+
+        } // Finished assessing whether to skip this partition
+
+        if (skip_partition) {
+          // printf("\tSKIPPING [");
+          // for (int i = 0; i < locality; ++i) printf("%u, ", partition[i]);
+          // printf("]\n");
+          continue; // To next partition
+        }
+
+        // printf("\tVALID [");
+        // for (int i = 0; i < locality; ++i) printf("%u, ", partition[i]);
+        // printf("]\n");
+
+        // This partition is valid;
+        // If it's the first valid partition we see, continue onto adding
+        // it to the `split_terms`, otherwise, only add it if the score
+        // matches last seen fitting partition.
+        // Because partitions are in descending score order, if this partition
+        // has a lower score than previously seen, immediately stop iterating
+        // over the partitions
+        if (!fitting_score.some) {
+          fitting_score = option_from_uint(score);
+        } else if (score < fitting_score.data) {
+          break;
+        }
+
+        vector_push(&best, &partition_index);
+
+        // Increase the partition's score
+        // Note that because `partition_score` was sorted in advance, this
+        // doesn't interfere with the iteration over partitions
+        partition_score[partscore_index].score += 1;
+
+      } // Done iterating over partitions (in descending score)
+
+      // "Free" (decref) the iterator over the systems
+      Py_DECREF(systems_fastseq);
+
+      // Could not find any partitions to fit the term into? This should not
+      // happen...
+      if (best.size == 0) {
+        PyErr_SetString(
+            ModuleError,
+            "Could not find any partition to fit a term? This should "
+            "not happen!");
+        for (unsigned int i = 0; i < partition_count; ++i) {
+          Vector *split_term = split_terms + i;
+          vector_free(split_term);
+        }
+        free(split_terms);
+        free(hamiltonian);
+        free(partitions);
+        free(partition_score);
+        return NULL;
       }
 
-      vector_push(&best, &partition_index);
+      // Split the coefficient over all possible partitions
+      for (unsigned int best_index = 0; best_index < best.size; ++best_index) {
+        unsigned int partition_index =
+            *(unsigned int *)vector_get_raw(&best, best_index);
 
-      // Increase the partition's score
-      // Note that because `partition_score` was sorted in advance, this
-      // doesn't interfere with the iteration over partitions
-      partition_score[partscore_index].score += 1;
+        CoefTermIndexPair value = (CoefTermIndexPair){
+            .coef = coef / (double)(best.size),
+            .term_index = term_index,
+        };
 
-    }  // Done iterating over partitions (in descending score)
-
-    // "Free" (decref) the iterator over the systems
-    Py_DECREF(systems_fastseq);
-
-    // Could not find any partitions to fit the term into? This should not
-    // happen...
-    if (best.size == 0) {
-      PyErr_SetString(ModuleError,
-                      "Could not find any partition to fit a term? This should "
-                      "not happen!");
-      for (unsigned int i = 0; i < partition_count; ++i) {
-        Vector *split_term = split_terms + i;
-        vector_free(split_term);
+        Vector *split_term = split_terms + partition_index;
+        vector_push(split_term, &value);
       }
-      free(split_terms);
-      free(hamiltonian);
-      free(partitions);
-      free(partition_score);
-      return NULL;
-    }
 
-    // Split the coefficient over all possible partitions
-    for (unsigned int best_index = 0; best_index < best.size; ++best_index) {
-      unsigned int partition_index =
-          *(unsigned int *)vector_get_raw(&best, best_index);
+    } // Done iterating over terms (in descending system count)
 
-      CoefTermIndexPair value = (CoefTermIndexPair){
-          .coef = coef / (double)(best.size),
-          .term_index = term_index,
-      };
-
-      Vector *split_term = split_terms + partition_index;
-      vector_push(split_term, &value);
-    }
-
-  }  // Done iterating over terms (in descending system count)
+    vector_free(&best);
+  } // Finished assigning terms to partitions via score
 
   // Cull partitions that did not have terms
 
@@ -406,7 +437,8 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
   unsigned int non_empty_count = 0;
   for (unsigned int partition_index = 0; partition_index < partition_count;
        ++partition_index) {
-    if (split_terms[partition_index].size != 0) non_empty_count++;
+    if (split_terms[partition_index].size != 0)
+      non_empty_count++;
   }
 
   // Prepare tuple to return; each element of the tuple will be another
@@ -417,7 +449,8 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
   for (unsigned int partition_index = 0; partition_index < partition_count;
        ++partition_index) {
     Vector *split_term = split_terms + partition_index;
-    if (split_term->size == 0) continue;
+    if (split_term->size == 0)
+      continue;
 
     PyObject *item_tuple = PyTuple_New(2);
 
@@ -461,6 +494,4 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
   return return_tuple;
 }
 
-static PyObject *decimate(PyObject *self, PyObject *args) {
-  
-}
+static PyObject *decimate(PyObject *self, PyObject *args) {}
