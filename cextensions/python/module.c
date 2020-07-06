@@ -281,7 +281,7 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
       {
         Result clean_r = vector_clean(&best);
         if (!clean_r.valid) {
-          PyErr_SetString("Qop internal error: Failed to clean `best` vector.");
+          PyErr_SetString(ModuleError, clean_r.content.error_details.reason);
           for (unsigned int i = 0; i < partition_count; ++i) {
             Vector *split_term = split_terms + i;
             vector_free(split_term);
