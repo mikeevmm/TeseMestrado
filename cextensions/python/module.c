@@ -236,11 +236,15 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
       PyObject *term = hamiltonian[term_index];
 
       // Extract info from term
-      double coef;
+      double _Complex coef;
       PyObject *operators;
       PyObject *systems;
       {
-        coef = PyFloat_AS_DOUBLE(PyList_GetItem(term, 0));
+		PyObject *pyCoef = PyList_GetItem(term, 0);
+		if (PyComplex_Check(pyCoef))
+			coef = PyComplex_RealAsDouble(pyCoef) + PyComplex_ImagAsDouble(pyCoef) * I;
+		else
+        	coef = PyFloat_AS_DOUBLE(pyCoef);
         operators = PyList_GetItem(term, 1);
         systems = PyList_GetItem(term, 2);
       }
@@ -418,7 +422,7 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
             *(unsigned int *)vector_get_raw(&best, best_index);
 
         CoefTermIndexPair value = (CoefTermIndexPair){
-            .coef = coef / (double)(best.size),
+            .coef = coef / (double _Complex)(best.size),
             .term_index = term_index,
         };
 
@@ -469,7 +473,7 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
       PyObject *coef_term_pair_tuple = PyTuple_New(2);
       CoefTermIndexPair pair =
           *(CoefTermIndexPair *)vector_get_raw(split_term, i);
-      PyTuple_SetItem(coef_term_pair_tuple, 0, PyFloat_FromDouble(pair.coef));
+      PyTuple_SetItem(coef_term_pair_tuple, 0, PyComplex_FromDoubles(creal(pair.coef), cimag(pair.coef)));
       PyTuple_SetItem(coef_term_pair_tuple, 1,
                       PyLong_FromSsize_t(pair.term_index));
       PyTuple_SetItem(split_term_pairs, i, coef_term_pair_tuple);
@@ -493,5 +497,3 @@ static PyObject *find_used_partitions(PyObject *self, PyObject *args) {
 
   return return_tuple;
 }
-
-static PyObject *decimate(PyObject *self, PyObject *args) {}

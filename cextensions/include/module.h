@@ -5,9 +5,10 @@
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 
 #include <Python.h>
-#include <numpy/arrayobject.h>
 #include <stdbool.h>
 #include <stdlib.h>
+#include <complex.h>
+#include <numpy/arrayobject.h>
 #include "include/combinations.h"
 #include "include/option.h"
 #include "include/twiddle.h"
@@ -24,7 +25,6 @@ typedef struct {
 } CoefTermIndexPair;
 
 static PyObject *find_used_partitions(PyObject *self, PyObject *args);
-static PyObject *decimate(PyObject *self, PyObject *args);
 
 static PyObject *ModuleError;
 
@@ -42,10 +42,6 @@ static PyMethodDef mod_methods[] = {
      "NOTE: hamiltonian is assumed to be sorted in descending "
      "number of interacting systems! If this is not the case, "
      "behaviour is undefined."},
-     {"decimate", decimate, METH_VARARGS,
-     "Reduce the locality of a hamiltonian to `floor(k/2)+1`, where "
-     "`k` is the locality of the given hamiltonian.\n"
-     "TODO"},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef module = {
