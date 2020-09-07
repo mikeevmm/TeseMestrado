@@ -686,20 +686,17 @@ def ansatz(nqubits, nlayers):
 
 
 def ground_state_from_terms(hamiltonian, num_systems, analytical=False, circuit=None, gates=None):
+    matrix = matrix_from_terms(hamiltonian, num_systems).todense()
     if analytical:
         # return np.min(scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
         #                                        k=1, which='SA', return_eigenvectors=False))
         try:
-            return np.min(np.linalg.eigvalsh(matrix_from_terms(hamiltonian, num_systems).toarray()))
-        except MemoryError:
-            return scipy.sparse.linalg.eigsh(matrix_from_terms(hamiltonian, num_systems),
-            k=1, which='SA')[0]
+            return np.min(np.linalg.eigvalsh(matrix))
         except MemoryError as memerror:
             print(f"For a {num_systems} qubit hamiltonian:")
             raise memerror
     else:
         # Simulate a variational eigensolver
-        matrix = matrix_from_terms(hamiltonian, num_systems)
 
         def eval(theta):
             for param, gate in zip(theta, gates):
@@ -707,12 +704,13 @@ def ground_state_from_terms(hamiltonian, num_systems, analytical=False, circuit=
             out = np.array(
                 circuit.run([1] + [0] * (2**num_systems - 1)))
             val = (np.conjugate(out.T) @ matrix @ out).real
-            return val
-            
+            return val[0][0]
+        
         optres = scipy.optimize.minimize(
             eval, [gate.get_parameters() for gate in gates], method='L-BFGS-B')
         gc.collect()
-        return optres.fun
+
+        return optres.fun[0][0]
 
 
 if __name__ == '__main__':
@@ -1153,8 +1151,6 @@ if __name__ == '__main__':
             intermediate.create_dataset(
                 "lower_bounds_nopart", (partitioned_file_count,), dtype=float)
             intermediate.create_dataset(
-                "lower_bounds_discard", (partitioned_file_count,), dtype=float)
-            intermediate.create_dataset(
                 "filename_index", (partitioned_file_count,), dtype=h5py.string_dtype())
 
             print("Calculating lower bounds...")
@@ -1188,16 +1184,13 @@ if __name__ == '__main__':
                         i for i in range(len(term[2]))]]
                     matrix = matrix_from_terms(
                         [keyed_term], len(term[2])).todense()
-                    return np.min(np.linalg.eigvalsh(matrix))
+                    return np.min(np.linalg.eigvalsh(matrix)).real
 
                 if CORES > 1:
                     with mp.Pool(CORES) as pool:
-                        #lower_bound = sum(map(mp_lowerbound, zip(partitions, split)))
                         lower_bound = sum(
                             pool.map(mp_lowerbound, zip(partitions, split)))
 
-                        #lower_bound_nopart = sum(
-                        #    map(mp_lowerbound_nopart, hamiltonian))
                         lower_bound_nopart = sum(
                             pool.map(mp_lowerbound_nopart, hamiltonian))
                 else:
@@ -1215,10 +1208,8 @@ if __name__ == '__main__':
                     lower_bound += local_ground_state
                 """
                 
-                intermediate["lower_bounds"][i] = lower_bound
-                if abs(lower_bound_nopart.imag) > 1e-10:
-                    raise Exception("Lower bounds (no partition) is significantly complex!")
-                intermediate["lower_bounds_nopart"][i] = lower_bound_nopart.real
+                intermediate["lower_bounds"][i] = float(lower_bound)
+                intermediate["lower_bounds_nopart"][i] = float(lower_bound_nopart)
 
             with open(f"{molecule_name}.txt", 'w') as output:
                 def get_hartree_fock(filename):
